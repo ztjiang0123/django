@@ -174,6 +174,27 @@ FORMFIELD_FOR_DBFIELD_DEFAULTS = {
 csrf_protect_m = method_decorator(csrf_protect)
 
 
+@dataclass
+class _ChangeFormState:
+    """Request-scoped state shared by the _changeform_view helpers."""
+
+    request: object
+    object_id: object
+    to_field: object
+    add: bool
+    obj: object = None
+    fieldsets: object = None
+    model_form: object = None
+    action_form: object = None
+    form: object = None
+    formsets: object = None
+    inline_instances: object = None
+    form_validated: bool = False
+    admin_form: object = None
+    media: object = None
+    inline_formsets: object = None
+
+
 class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
     """Functionality common to both ModelAdmin and InlineAdmin."""
 
@@ -2066,8 +2087,9 @@ class ModelAdmin(BaseModelAdmin):
         with transaction.atomic(using=router.db_for_write(self.model)):
             return self._changeform_view(request, object_id, form_url, extra_context)
 
-    def _build_changeform_action_form(self, request, obj, add):
+    def _build_changeform_action_form(self, state):
         """Return the change-form action form, or None when not applicable."""
+        request = state.request
         # RemovedInDjango70Warning: When the deprecation ends, replace with:
         # actions = self.get_actions(
         #     request, action_location=ActionLocation.CHANGE_FORM
@@ -2075,7 +2097,7 @@ class ModelAdmin(BaseModelAdmin):
         actions = self._get_actions_with_action_location(
             request, action_location=ActionLocation.CHANGE_FORM
         )
-        if not actions or add:
+        if not actions or state.add:
             return None
         action_location = ActionLocation.CHANGE_FORM
         action_form = self.action_form(auto_id=None, prefix=action_location.value)
@@ -2112,18 +2134,24 @@ class ModelAdmin(BaseModelAdmin):
             return response
         return HttpResponseRedirect(request.get_full_path())
 
-    def _save_changeform(self, request, form, formsets, add, form_validated):
+    def _save_changeform(self, state):
         """
         Persist a valid change form and its formsets.
 
         Return the redirect HttpResponse on success, or None when the
         submission was invalid.
         """
-        if form_validated:
+        request, form, formsets, add = (
+            state.request,
+            state.form,
+            state.formsets,
+            state.add,
+        )
+        if state.form_validated:
             new_object = self.save_form(request, form, change=not add)
         else:
             new_object = form.instance
-        if not (all_valid(formsets) and form_validated):
+        if not (all_valid(formsets) and state.form_validated):
             return None
 
         self.save_model(request, new_object, form, not add)
@@ -2135,7 +2163,7 @@ class ModelAdmin(BaseModelAdmin):
         self.log_change(request, new_object, change_message)
         return self.response_change(request, new_object)
 
-    def _resolve_changeform_object(self, request, object_id, to_field):
+    def _resolve_changeform_object(self, state):
         """
         Return the object being edited (None when adding).
 
@@ -2144,6 +2172,7 @@ class ModelAdmin(BaseModelAdmin):
         The return value is ``(obj, redirect_response)``; ``redirect_response``
         is non-None only when the caller should return it directly.
         """
+        request, object_id, to_field = state.request, state.object_id, state.to_field
         if object_id is None:
             if not self.has_add_permission(request):
                 raise PermissionDenied
@@ -2169,56 +2198,49 @@ class ModelAdmin(BaseModelAdmin):
         if request.method == "POST" and "_saveasnew" in request.POST:
             object_id = None
 
-        add = object_id is None
+        state = _ChangeFormState(
+            request=request,
+            object_id=object_id,
+            to_field=to_field,
+            add=object_id is None,
+        )
 
-        obj, redirect = self._resolve_changeform_object(request, object_id, to_field)
+        obj, redirect = self._resolve_changeform_object(state)
         if redirect is not None:
             return redirect
+        state.obj = obj
 
-        action_form = self._build_changeform_action_form(request, obj, add)
-        fieldsets = self.get_fieldsets(request, obj)
-        ModelForm = self.get_form(
-            request, obj, change=not add, fields=flatten_fieldsets(fieldsets)
+        state.action_form = self._build_changeform_action_form(state)
+        state.fieldsets = self.get_fieldsets(request, obj)
+        state.model_form = self.get_form(
+            request,
+            obj,
+            change=not state.add,
+            fields=flatten_fieldsets(state.fieldsets),
         )
-        form, formsets, inline_instances, form_validated, response = (
-            self._process_changeform_submission(
-                request, obj, add, ModelForm, action_form
-            )
-        )
+        response = self._process_changeform_submission(state)
         if response is not None:
             return response
 
-        admin_form = self._build_changeform_adminform(
-            request, obj, add, form, fieldsets
+        state.admin_form = self._build_changeform_adminform(state)
+        media = self.media + state.admin_form.media
+        state.inline_formsets = self.get_inline_formsets(
+            request, state.formsets, state.inline_instances, obj
         )
-        media = self.media + admin_form.media
-        inline_formsets = self.get_inline_formsets(
-            request, formsets, inline_instances, obj
-        )
-        for inline_formset in inline_formsets:
+        for inline_formset in state.inline_formsets:
             media += inline_formset.media
-        if action_form:
-            media += action_form.media
+        if state.action_form:
+            media += state.action_form.media
+        state.media = media
 
-        context = self._changeform_context(
-            request,
-            obj,
-            object_id,
-            add,
-            to_field,
-            admin_form,
-            media,
-            inline_formsets,
-            form,
-            formsets,
-            action_form,
-        )
+        context = self._changeform_context(state)
 
         # Hide the "Save" and "Save and continue" buttons if "Save as New" was
         # previously chosen to prevent the interface from getting confusing.
+        add = state.add
         saved_as_new = (
             request.method == "POST"
-            and not form_validated
+            and not state.form_validated
             and "_saveasnew" in request.POST
         )
         if saved_as_new:
@@ -2233,15 +2255,17 @@ class ModelAdmin(BaseModelAdmin):
             request, context, add=add, change=not add, obj=obj, form_url=form_url
         )
 
-    def _process_changeform_submission(self, request, obj, add, ModelForm, action_form):
+    def _process_changeform_submission(self, state):
         """
         Build the change form and its formsets for the current request.
 
-        Return a ``(form, formsets, inline_instances, form_validated,
-        response)`` tuple. ``response`` is a non-None HttpResponse when the
-        submission was handled (a bulk action or a successful save) and should
-        be returned directly.
+        Populate ``state.form``, ``state.formsets``,
+        ``state.inline_instances``, and ``state.form_validated``. Return a
+        non-None HttpResponse when the submission was handled (a bulk action or
+        a successful save) and should be returned directly.
         """
+        request, obj, add = state.request, state.obj, state.add
+        ModelForm = state.model_form
         if request.method != "POST":
             if add:
                 initial = self.get_changeform_initial_data(request)
@@ -2254,10 +2278,15 @@ class ModelAdmin(BaseModelAdmin):
                 formsets, inline_instances = self._create_formsets(
                     request, obj, change=True
                 )
-            return form, formsets, inline_instances, False, None
+            state.form, state.formsets, state.inline_instances = (
+                form,
+                formsets,
+                inline_instances,
+            )
+            return None
 
-        if self._is_changeform_action_submit(request, action_form):
-            return None, None, None, False, self._handle_changeform_action(request, obj)
+        if self._is_changeform_action_submit(request, state.action_form):
+            return self._handle_changeform_action(request, obj)
 
         if not add and not self.has_change_permission(request, obj):
             raise PermissionDenied
@@ -2268,21 +2297,28 @@ class ModelAdmin(BaseModelAdmin):
             form.instance,
             change=not add,
         )
-        form_validated = form.is_valid()
-        response = self._save_changeform(request, form, formsets, add, form_validated)
+        state.form, state.formsets, state.inline_instances = (
+            form,
+            formsets,
+            inline_instances,
+        )
+        state.form_validated = form.is_valid()
+        response = self._save_changeform(state)
         if response is not None:
-            return form, formsets, inline_instances, form_validated, response
-        return form, formsets, inline_instances, False, None
+            return response
+        state.form_validated = False
+        return None
 
-    def _build_changeform_adminform(self, request, obj, add, form, fieldsets):
+    def _build_changeform_adminform(self, state):
         """Return the AdminForm for the change form."""
+        request, obj, add = state.request, state.obj, state.add
         if not add and not self.has_change_permission(request, obj):
-            readonly_fields = flatten_fieldsets(fieldsets)
+            readonly_fields = flatten_fieldsets(state.fieldsets)
         else:
             readonly_fields = self.get_readonly_fields(request, obj)
         return helpers.AdminForm(
-            form,
-            list(fieldsets),
+            state.form,
+            list(state.fieldsets),
             # Clear prepopulated fields on a view-only form to avoid a crash.
             (
                 self.get_prepopulated_fields(request, obj)
@@ -2301,22 +2337,10 @@ class ModelAdmin(BaseModelAdmin):
             return _("Change %s")
         return _("View %s")
 
-    def _changeform_context(
-        self,
-        request,
-        obj,
-        object_id,
-        add,
-        to_field,
-        admin_form,
-        media,
-        inline_formsets,
-        form,
-        formsets,
-        action_form,
-    ):
+    def _changeform_context(self, state):
         """Build the template context for the change form."""
-        title = self._changeform_title(request, obj, add)
+        request, obj = state.request, state.obj
+        title = self._changeform_title(request, obj, state.add)
         is_popup = IS_POPUP_VAR in request.POST or IS_POPUP_VAR in request.GET
         return {
             **self.admin_site.each_context(request),
@@ -2324,17 +2348,17 @@ class ModelAdmin(BaseModelAdmin):
             "subtitle": (
                 display_for_value(str(obj), EMPTY_VALUE_STRING) if obj else None
             ),
-            "adminform": admin_form,
-            "object_id": object_id,
+            "adminform": state.admin_form,
+            "object_id": state.object_id,
             "original": obj,
             "is_popup": is_popup,
             "source_model": request.GET.get(SOURCE_MODEL_VAR),
-            "to_field": to_field,
-            "media": media,
-            "action_form": action_form,
+            "to_field": state.to_field,
+            "media": state.media,
+            "action_form": state.action_form,
             "action_checkbox_name": helpers.ACTION_CHECKBOX_NAME,
-            "inline_admin_formsets": inline_formsets,
-            "errors": helpers.AdminErrorList(form, formsets),
+            "inline_admin_formsets": state.inline_formsets,
+            "errors": helpers.AdminErrorList(state.form, state.formsets),
             "preserved_filters": self.get_preserved_filters(request),
         }
 
