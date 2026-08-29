@@ -97,6 +97,84 @@ class AppConfig:
         return paths[0]
 
     @classmethod
+    def _get_default_app_config_class(cls, entry, app_module):
+        """
+        Return the AppConfig subclass declared by the ``apps`` submodule of
+        ``app_module``, or None if the entry has no such submodule.
+
+        If the apps submodule defines a single AppConfig subclass, it is used
+        automatically. To prevent this, an AppConfig subclass can declare a
+        class variable ``default = False``. If the apps submodule defines more
+        than one AppConfig subclass, the default one can declare
+        ``default = True``.
+        """
+        if not module_has_submodule(app_module, APPS_MODULE_NAME):
+            return None
+
+        mod_path = "%s.%s" % (entry, APPS_MODULE_NAME)
+        mod = import_module(mod_path)
+        # Collect AppConfig candidates, excluding those that explicitly define
+        # default = False.
+        app_configs = [
+            (name, candidate)
+            for name, candidate in inspect.getmembers(mod, inspect.isclass)
+            if (
+                issubclass(candidate, cls)
+                and candidate is not cls
+                and getattr(candidate, "default", True)
+            )
+        ]
+        if len(app_configs) == 1:
+            return app_configs[0][1]
+
+        # Otherwise, look for exactly one AppConfig subclass that explicitly
+        # defines default = True.
+        default_configs = [
+            (name, candidate)
+            for name, candidate in app_configs
+            if getattr(candidate, "default", False)
+        ]
+        if len(default_configs) > 1:
+            candidates = [repr(name) for name, _ in default_configs]
+            raise RuntimeError(
+                "%r declares more than one default AppConfig: "
+                "%s." % (mod_path, ", ".join(candidates))
+            )
+        if len(default_configs) == 1:
+            return default_configs[0][1]
+        return None
+
+    @classmethod
+    def _raise_invalid_entry_error(cls, entry):
+        """
+        Raise a helpful error when ``entry`` is neither an importable app
+        module nor an importable app config class.
+        """
+        # If the last component of entry starts with an uppercase letter, then
+        # it was likely intended to be an app config class; if not, an app
+        # module. Provide a nice error message in both cases.
+        mod_path, _, cls_name = entry.rpartition(".")
+        if not (mod_path and cls_name[0].isupper()):
+            # Re-trigger the module import exception.
+            import_module(entry)
+            return
+
+        # We could simply re-trigger the string import exception, but we're
+        # going the extra mile and providing a better error message for typos
+        # in INSTALLED_APPS. This may raise ImportError, which is the best
+        # exception possible if the module at mod_path cannot be imported.
+        mod = import_module(mod_path)
+        candidates = [
+            repr(name)
+            for name, candidate in inspect.getmembers(mod, inspect.isclass)
+            if issubclass(candidate, cls) and candidate is not cls
+        ]
+        msg = "Module '%s' does not contain a '%s' class." % (mod_path, cls_name)
+        if candidates:
+            msg += " Choices are: %s." % ", ".join(candidates)
+        raise ImportError(msg)
+
+    @classmethod
     def create(cls, entry):
         """
         Factory that creates an app config from an entry in INSTALLED_APPS.
@@ -112,45 +190,7 @@ class AppConfig:
         except Exception:
             pass
         else:
-            # If app_module has an apps submodule that defines a single
-            # AppConfig subclass, use it automatically.
-            # To prevent this, an AppConfig subclass can declare a class
-            # variable default = False.
-            # If the apps module defines more than one AppConfig subclass,
-            # the default one can declare default = True.
-            if module_has_submodule(app_module, APPS_MODULE_NAME):
-                mod_path = "%s.%s" % (entry, APPS_MODULE_NAME)
-                mod = import_module(mod_path)
-                # Check if there's exactly one AppConfig candidate,
-                # excluding those that explicitly define default = False.
-                app_configs = [
-                    (name, candidate)
-                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
-                    if (
-                        issubclass(candidate, cls)
-                        and candidate is not cls
-                        and getattr(candidate, "default", True)
-                    )
-                ]
-                if len(app_configs) == 1:
-                    app_config_class = app_configs[0][1]
-                else:
-                    # Check if there's exactly one AppConfig subclass,
-                    # among those that explicitly define default = True.
-                    app_configs = [
-                        (name, candidate)
-                        for name, candidate in app_configs
-                        if getattr(candidate, "default", False)
-                    ]
-                    if len(app_configs) > 1:
-                        candidates = [repr(name) for name, _ in app_configs]
-                        raise RuntimeError(
-                            "%r declares more than one default AppConfig: "
-                            "%s." % (mod_path, ", ".join(candidates))
-                        )
-                    elif len(app_configs) == 1:
-                        app_config_class = app_configs[0][1]
-
+            app_config_class = cls._get_default_app_config_class(entry, app_module)
             # Use the default app config class if we didn't find anything.
             if app_config_class is None:
                 app_config_class = cls
@@ -165,32 +205,7 @@ class AppConfig:
         # If both import_module and import_string failed, it means that entry
         # doesn't have a valid value.
         if app_module is None and app_config_class is None:
-            # If the last component of entry starts with an uppercase letter,
-            # then it was likely intended to be an app config class; if not,
-            # an app module. Provide a nice error message in both cases.
-            mod_path, _, cls_name = entry.rpartition(".")
-            if mod_path and cls_name[0].isupper():
-                # We could simply re-trigger the string import exception, but
-                # we're going the extra mile and providing a better error
-                # message for typos in INSTALLED_APPS.
-                # This may raise ImportError, which is the best exception
-                # possible if the module at mod_path cannot be imported.
-                mod = import_module(mod_path)
-                candidates = [
-                    repr(name)
-                    for name, candidate in inspect.getmembers(mod, inspect.isclass)
-                    if issubclass(candidate, cls) and candidate is not cls
-                ]
-                msg = "Module '%s' does not contain a '%s' class." % (
-                    mod_path,
-                    cls_name,
-                )
-                if candidates:
-                    msg += " Choices are: %s." % ", ".join(candidates)
-                raise ImportError(msg)
-            else:
-                # Re-trigger the module import exception.
-                import_module(entry)
+            cls._raise_invalid_entry_error(entry)
 
         # Check for obvious errors. (This check prevents duck typing, but
         # it could be removed if it became a problem in practice.)

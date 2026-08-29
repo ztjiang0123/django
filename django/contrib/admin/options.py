@@ -174,6 +174,27 @@ FORMFIELD_FOR_DBFIELD_DEFAULTS = {
 csrf_protect_m = method_decorator(csrf_protect)
 
 
+@dataclass
+class _ChangeFormState:
+    """Request-scoped state shared by the _changeform_view helpers."""
+
+    request: object
+    object_id: object
+    to_field: object
+    add: bool
+    obj: object = None
+    fieldsets: object = None
+    model_form: object = None
+    action_form: object = None
+    form: object = None
+    formsets: object = None
+    inline_instances: object = None
+    form_validated: bool = False
+    admin_form: object = None
+    media: object = None
+    inline_formsets: object = None
+
+
 class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
     """Functionality common to both ModelAdmin and InlineAdmin."""
 
@@ -1305,6 +1326,46 @@ class ModelAdmin(BaseModelAdmin):
         """
 
         # Apply keyword searches.
+        search_prefixes = {
+            "^": "istartswith",
+            "=": "iexact",
+            "@": "search",
+        }
+
+        def resolve_explicit_lookup(field_name):
+            """
+            Return (lookup, field_to_validate) when field_name ends in an
+            explicit query lookup (e.g. "field__exact"), or None if it names a
+            plain field path.
+
+            field_to_validate is set for non-text exact lookups so that
+            invalid search terms can be skipped (preserving index usage).
+            """
+            opts = queryset.model._meta
+            prev_field = None
+            # Go through the fields, following all relations.
+            for path_part in field_name.split(LOOKUP_SEP):
+                if path_part == "pk":
+                    path_part = opts.pk.name
+                try:
+                    field = opts.get_field(path_part)
+                except FieldDoesNotExist:
+                    # path_part is not a field; check for a valid query lookup.
+                    if not (prev_field and prev_field.get_lookup(path_part)):
+                        continue
+                    is_text_field = isinstance(
+                        prev_field, (models.CharField, models.TextField)
+                    )
+                    if path_part == "exact" and not is_text_field:
+                        # Use prev_field to validate the search term.
+                        return field_name, prev_field
+                    return field_name, None
+                prev_field = field
+                if hasattr(field, "path_infos"):
+                    # Update opts to follow the relation.
+                    opts = field.path_infos[-1].to_opts
+            return None
+
         def construct_search(field_name):
             """
             Return a tuple of (lookup, field_to_validate).
@@ -1312,36 +1373,17 @@ class ModelAdmin(BaseModelAdmin):
             field_to_validate is set for non-text exact lookups so that
             invalid search terms can be skipped (preserving index usage).
             """
-            if field_name.startswith("^"):
-                return "%s__istartswith" % field_name.removeprefix("^"), None
-            elif field_name.startswith("="):
-                return "%s__iexact" % field_name.removeprefix("="), None
-            elif field_name.startswith("@"):
-                return "%s__search" % field_name.removeprefix("@"), None
+            prefix = field_name[:1]
+            if prefix in search_prefixes:
+                lookup = "%s__%s" % (
+                    field_name.removeprefix(prefix),
+                    search_prefixes[prefix],
+                )
+                return lookup, None
             # Use field_name if it includes a lookup.
-            opts = queryset.model._meta
-            lookup_fields = field_name.split(LOOKUP_SEP)
-            # Go through the fields, following all relations.
-            prev_field = None
-            for path_part in lookup_fields:
-                if path_part == "pk":
-                    path_part = opts.pk.name
-                try:
-                    field = opts.get_field(path_part)
-                except FieldDoesNotExist:
-                    # Use valid query lookups.
-                    if prev_field and prev_field.get_lookup(path_part):
-                        if path_part == "exact" and not isinstance(
-                            prev_field, (models.CharField, models.TextField)
-                        ):
-                            # Use prev_field to validate the search term.
-                            return field_name, prev_field
-                        return field_name, None
-                else:
-                    prev_field = field
-                    if hasattr(field, "path_infos"):
-                        # Update opts to follow the relation.
-                        opts = field.path_infos[-1].to_opts
+            explicit_lookup = resolve_explicit_lookup(field_name)
+            if explicit_lookup is not None:
+                return explicit_lookup
             # Otherwise, use the field with icontains.
             return "%s__icontains" % field_name, None
 
@@ -2045,6 +2087,107 @@ class ModelAdmin(BaseModelAdmin):
         with transaction.atomic(using=router.db_for_write(self.model)):
             return self._changeform_view(request, object_id, form_url, extra_context)
 
+    def _build_changeform_action_form(self, state):
+        """Return the change-form action form, or None when not applicable."""
+        request = state.request
+        # RemovedInDjango70Warning: When the deprecation ends, replace with:
+        # actions = self.get_actions(
+        #     request, action_location=ActionLocation.CHANGE_FORM
+        # )
+        actions = self._get_actions_with_action_location(
+            request, action_location=ActionLocation.CHANGE_FORM
+        )
+        if not actions or state.add:
+            return None
+        action_location = ActionLocation.CHANGE_FORM
+        action_form = self.action_form(auto_id=None, prefix=action_location.value)
+        # RemovedInDjango70Warning: When the deprecation ends, replace:
+        # action_form.fields["action"].choices = self.get_action_choices(
+        #     request, action_location=action_location
+        # )
+        action_form.fields["action"].choices = (
+            self._get_action_choices_with_action_location(
+                request, action_location=action_location
+            )
+        )
+        return action_form
+
+    def _is_changeform_action_submit(self, request, action_form):
+        """Return whether the POST is an action submission (not a save)."""
+        return (
+            action_form
+            and action_form["action"].html_name in request.POST
+            and "_save" not in request.POST
+            and "_continue" not in request.POST
+            and "_addanother" not in request.POST
+        )
+
+    def _handle_changeform_action(self, request, obj):
+        """Run a change-form bulk action and return its HttpResponse."""
+        selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
+        if len(selected) != 1 or selected[0] != str(obj.pk):
+            raise BadRequest
+        queryset = self.get_queryset(request)
+        if response := self.response_action(
+            request, queryset, action_location=ActionLocation.CHANGE_FORM
+        ):
+            return response
+        return HttpResponseRedirect(request.get_full_path())
+
+    def _save_changeform(self, state):
+        """
+        Persist a valid change form and its formsets.
+
+        Return the redirect HttpResponse on success, or None when the
+        submission was invalid.
+        """
+        request, form, formsets, add = (
+            state.request,
+            state.form,
+            state.formsets,
+            state.add,
+        )
+        if state.form_validated:
+            new_object = self.save_form(request, form, change=not add)
+        else:
+            new_object = form.instance
+        if not (all_valid(formsets) and state.form_validated):
+            return None
+
+        self.save_model(request, new_object, form, not add)
+        self.save_related(request, form, formsets, not add)
+        change_message = self.construct_change_message(request, form, formsets, add)
+        if add:
+            self.log_addition(request, new_object, change_message)
+            return self.response_add(request, new_object)
+        self.log_change(request, new_object, change_message)
+        return self.response_change(request, new_object)
+
+    def _resolve_changeform_object(self, state):
+        """
+        Return the object being edited (None when adding).
+
+        Raise PermissionDenied when the user lacks access, and return a
+        redirect response wrapped in a tuple when the object does not exist.
+        The return value is ``(obj, redirect_response)``; ``redirect_response``
+        is non-None only when the caller should return it directly.
+        """
+        request, object_id, to_field = state.request, state.object_id, state.to_field
+        if object_id is None:
+            if not self.has_add_permission(request):
+                raise PermissionDenied
+            return None, None
+
+        obj = self.get_object(request, unquote(object_id), to_field)
+        if not self.has_view_or_change_permission(request, obj):
+            raise PermissionDenied
+        if obj is None:
+            redirect = self._get_obj_does_not_exist_redirect(
+                request, self.opts, object_id
+            )
+            return None, redirect
+        return obj, None
+
     def _changeform_view(self, request, object_id, form_url, extra_context):
         to_field = request.POST.get(TO_FIELD_VAR, request.GET.get(TO_FIELD_VAR))
         if to_field and not self.to_field_allowed(request, to_field):
@@ -2055,94 +2198,75 @@ class ModelAdmin(BaseModelAdmin):
         if request.method == "POST" and "_saveasnew" in request.POST:
             object_id = None
 
-        add = object_id is None
-
-        if add:
-            if not self.has_add_permission(request):
-                raise PermissionDenied
-            obj = None
-
-        else:
-            obj = self.get_object(request, unquote(object_id), to_field)
-            if not self.has_view_or_change_permission(request, obj):
-                raise PermissionDenied
-
-            if obj is None:
-                return self._get_obj_does_not_exist_redirect(
-                    request, self.opts, object_id
-                )
-
-        action_form = None
-        # RemovedInDjango70Warning: When the deprecation ends, replace with:
-        # actions = self.get_actions(
-        #     request, action_location=ActionLocation.CHANGE_FORM
-        # )
-        actions = self._get_actions_with_action_location(
-            request, action_location=ActionLocation.CHANGE_FORM
+        state = _ChangeFormState(
+            request=request,
+            object_id=object_id,
+            to_field=to_field,
+            add=object_id is None,
         )
-        if actions and not add:
-            action_location = ActionLocation.CHANGE_FORM
-            action_form = self.action_form(auto_id=None, prefix=action_location.value)
-            # RemovedInDjango70Warning: When the deprecation ends, replace:
-            # action_form.fields["action"].choices = self.get_action_choices(
-            #     request, action_location=action_location
-            # )
-            action_form.fields["action"].choices = (
-                self._get_action_choices_with_action_location(
-                    request, action_location=action_location
-                )
-            )
-        fieldsets = self.get_fieldsets(request, obj)
-        ModelForm = self.get_form(
-            request, obj, change=not add, fields=flatten_fieldsets(fieldsets)
+
+        obj, redirect = self._resolve_changeform_object(state)
+        if redirect is not None:
+            return redirect
+        state.obj = obj
+
+        state.action_form = self._build_changeform_action_form(state)
+        state.fieldsets = self.get_fieldsets(request, obj)
+        state.model_form = self.get_form(
+            request,
+            obj,
+            change=not state.add,
+            fields=flatten_fieldsets(state.fieldsets),
         )
-        if request.method == "POST":
-            if (
-                action_form
-                and action_form["action"].html_name in request.POST
-                and "_save" not in request.POST
-                and "_continue" not in request.POST
-                and "_addanother" not in request.POST
-            ):
-                selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
-                if len(selected) != 1 or selected[0] != str(obj.pk):
-                    raise BadRequest
-                queryset = self.get_queryset(request)
-                if response := self.response_action(
-                    request, queryset, action_location=ActionLocation.CHANGE_FORM
-                ):
-                    return response
-                return HttpResponseRedirect(request.get_full_path())
+        response = self._process_changeform_submission(state)
+        if response is not None:
+            return response
 
-            if not add and not self.has_change_permission(request, obj):
-                raise PermissionDenied
+        state.admin_form = self._build_changeform_adminform(state)
+        media = self.media + state.admin_form.media
+        state.inline_formsets = self.get_inline_formsets(
+            request, state.formsets, state.inline_instances, obj
+        )
+        for inline_formset in state.inline_formsets:
+            media += inline_formset.media
+        if state.action_form:
+            media += state.action_form.media
+        state.media = media
 
-            form = ModelForm(request.POST, request.FILES, instance=obj)
-            formsets, inline_instances = self._create_formsets(
-                request,
-                form.instance,
-                change=not add,
-            )
-            form_validated = form.is_valid()
-            if form_validated:
-                new_object = self.save_form(request, form, change=not add)
-            else:
-                new_object = form.instance
-            if all_valid(formsets) and form_validated:
-                self.save_model(request, new_object, form, not add)
-                self.save_related(request, form, formsets, not add)
-                change_message = self.construct_change_message(
-                    request, form, formsets, add
-                )
-                if add:
-                    self.log_addition(request, new_object, change_message)
-                    return self.response_add(request, new_object)
-                else:
-                    self.log_change(request, new_object, change_message)
-                    return self.response_change(request, new_object)
-            else:
-                form_validated = False
-        else:
+        context = self._changeform_context(state)
+
+        # Hide the "Save" and "Save and continue" buttons if "Save as New" was
+        # previously chosen to prevent the interface from getting confusing.
+        add = state.add
+        saved_as_new = (
+            request.method == "POST"
+            and not state.form_validated
+            and "_saveasnew" in request.POST
+        )
+        if saved_as_new:
+            context["show_save"] = False
+            context["show_save_and_continue"] = False
+            # Use the change template instead of the add template.
+            add = False
+
+        context.update(extra_context or {})
+
+        return self.render_change_form(
+            request, context, add=add, change=not add, obj=obj, form_url=form_url
+        )
+
+    def _process_changeform_submission(self, state):
+        """
+        Build the change form and its formsets for the current request.
+
+        Populate ``state.form``, ``state.formsets``,
+        ``state.inline_instances``, and ``state.form_validated``. Return a
+        non-None HttpResponse when the submission was handled (a bulk action or
+        a successful save) and should be returned directly.
+        """
+        request, obj, add = state.request, state.obj, state.add
+        ModelForm = state.model_form
+        if request.method != "POST":
             if add:
                 initial = self.get_changeform_initial_data(request)
                 form = ModelForm(initial=initial)
@@ -2154,14 +2278,47 @@ class ModelAdmin(BaseModelAdmin):
                 formsets, inline_instances = self._create_formsets(
                     request, obj, change=True
                 )
+            state.form, state.formsets, state.inline_instances = (
+                form,
+                formsets,
+                inline_instances,
+            )
+            return None
+
+        if self._is_changeform_action_submit(request, state.action_form):
+            return self._handle_changeform_action(request, obj)
 
         if not add and not self.has_change_permission(request, obj):
-            readonly_fields = flatten_fieldsets(fieldsets)
+            raise PermissionDenied
+
+        form = ModelForm(request.POST, request.FILES, instance=obj)
+        formsets, inline_instances = self._create_formsets(
+            request,
+            form.instance,
+            change=not add,
+        )
+        state.form, state.formsets, state.inline_instances = (
+            form,
+            formsets,
+            inline_instances,
+        )
+        state.form_validated = form.is_valid()
+        response = self._save_changeform(state)
+        if response is not None:
+            return response
+        state.form_validated = False
+        return None
+
+    def _build_changeform_adminform(self, state):
+        """Return the AdminForm for the change form."""
+        request, obj, add = state.request, state.obj, state.add
+        if not add and not self.has_change_permission(request, obj):
+            readonly_fields = flatten_fieldsets(state.fieldsets)
         else:
             readonly_fields = self.get_readonly_fields(request, obj)
-        admin_form = helpers.AdminForm(
-            form,
-            list(fieldsets),
+        return helpers.AdminForm(
+            state.form,
+            list(state.fieldsets),
             # Clear prepopulated fields on a view-only form to avoid a crash.
             (
                 self.get_prepopulated_fields(request, obj)
@@ -2171,59 +2328,39 @@ class ModelAdmin(BaseModelAdmin):
             readonly_fields,
             model_admin=self,
         )
-        media = self.media + admin_form.media
 
-        inline_formsets = self.get_inline_formsets(
-            request, formsets, inline_instances, obj
-        )
-        for inline_formset in inline_formsets:
-            media += inline_formset.media
-        if action_form:
-            media += action_form.media
-
+    def _changeform_title(self, request, obj, add):
+        """Return the translatable title template for the change form."""
         if add:
-            title = _("Add %s")
-        elif self.has_change_permission(request, obj):
-            title = _("Change %s")
-        else:
-            title = _("View %s")
-        context = {
+            return _("Add %s")
+        if self.has_change_permission(request, obj):
+            return _("Change %s")
+        return _("View %s")
+
+    def _changeform_context(self, state):
+        """Build the template context for the change form."""
+        request, obj = state.request, state.obj
+        title = self._changeform_title(request, obj, state.add)
+        is_popup = IS_POPUP_VAR in request.POST or IS_POPUP_VAR in request.GET
+        return {
             **self.admin_site.each_context(request),
             "title": title % self.opts.verbose_name,
             "subtitle": (
                 display_for_value(str(obj), EMPTY_VALUE_STRING) if obj else None
             ),
-            "adminform": admin_form,
-            "object_id": object_id,
+            "adminform": state.admin_form,
+            "object_id": state.object_id,
             "original": obj,
-            "is_popup": IS_POPUP_VAR in request.POST or IS_POPUP_VAR in request.GET,
+            "is_popup": is_popup,
             "source_model": request.GET.get(SOURCE_MODEL_VAR),
-            "to_field": to_field,
-            "media": media,
-            "action_form": action_form,
+            "to_field": state.to_field,
+            "media": state.media,
+            "action_form": state.action_form,
             "action_checkbox_name": helpers.ACTION_CHECKBOX_NAME,
-            "inline_admin_formsets": inline_formsets,
-            "errors": helpers.AdminErrorList(form, formsets),
+            "inline_admin_formsets": state.inline_formsets,
+            "errors": helpers.AdminErrorList(state.form, state.formsets),
             "preserved_filters": self.get_preserved_filters(request),
         }
-
-        # Hide the "Save" and "Save and continue" buttons if "Save as New" was
-        # previously chosen to prevent the interface from getting confusing.
-        if (
-            request.method == "POST"
-            and not form_validated
-            and "_saveasnew" in request.POST
-        ):
-            context["show_save"] = False
-            context["show_save_and_continue"] = False
-            # Use the change template instead of the add template.
-            add = False
-
-        context.update(extra_context or {})
-
-        return self.render_change_form(
-            request, context, add=add, change=not add, obj=obj, form_url=form_url
-        )
 
     def add_view(self, request, form_url="", extra_context=None):
         return self.changeform_view(request, None, form_url, extra_context)
@@ -2298,6 +2435,50 @@ class ModelAdmin(BaseModelAdmin):
             }
             self.message_user(request, msg, messages.SUCCESS)
 
+    def _handle_changelist_action(self, request, cl, actions):
+        """
+        Handle a POSTed bulk action from the changelist.
+
+        Return a ``(response, action_failed)`` tuple. ``response`` is a
+        non-None HttpResponse when the action produced one and should be
+        returned directly; ``action_failed`` signals that the changelist
+        should redirect back to itself.
+        """
+        if not (actions and request.method == "POST"):
+            return None, False
+        if "_save" in request.POST:
+            # Let bulk-edit saves fall through to the changelist form handling.
+            return None, False
+
+        selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
+        is_unconfirmed_action = "index" in request.POST
+        is_confirmed_action = (
+            helpers.ACTION_CHECKBOX_NAME in request.POST and "index" not in request.POST
+        )
+        if not (is_unconfirmed_action or is_confirmed_action):
+            return None, False
+
+        if not selected:
+            # Confirmed actions with no selection fall through silently to
+            # preserve the historical behavior; unconfirmed ones warn the user.
+            if is_unconfirmed_action:
+                msg = _(
+                    "Items must be selected in order to perform "
+                    "actions on them. No items have been changed."
+                )
+                self.message_user(request, msg, messages.WARNING)
+                return None, True
+            return None, False
+
+        response = self.response_action(
+            request,
+            queryset=cl.get_queryset(request),
+            action_location=ActionLocation.CHANGE_LIST,
+        )
+        if response:
+            return response, False
+        return None, True
+
     @csrf_protect_m
     def changelist_view(self, request, extra_context=None):
         """
@@ -2331,9 +2512,6 @@ class ModelAdmin(BaseModelAdmin):
         # edit. Try to look up an action or confirmation first, but if this
         # isn't an action the POST will fall through to the bulk edit check,
         # below.
-        action_failed = False
-        selected = request.POST.getlist(helpers.ACTION_CHECKBOX_NAME)
-
         # RemovedInDjango70Warning: When the deprecation ends, replace with:
         # actions = self.get_actions(
         #     request, action_location=ActionLocation.CHANGE_LIST
@@ -2341,50 +2519,11 @@ class ModelAdmin(BaseModelAdmin):
         actions = self._get_actions_with_action_location(
             request, action_location=ActionLocation.CHANGE_LIST
         )
-        # Actions with no confirmation
-        if (
-            actions
-            and request.method == "POST"
-            and "index" in request.POST
-            and "_save" not in request.POST
-        ):
-            if selected:
-                response = self.response_action(
-                    request,
-                    queryset=cl.get_queryset(request),
-                    action_location=ActionLocation.CHANGE_LIST,
-                )
-                if response:
-                    return response
-                else:
-                    action_failed = True
-            else:
-                msg = _(
-                    "Items must be selected in order to perform "
-                    "actions on them. No items have been changed."
-                )
-                self.message_user(request, msg, messages.WARNING)
-                action_failed = True
-
-        # Actions with confirmation
-        if (
-            actions
-            and request.method == "POST"
-            and helpers.ACTION_CHECKBOX_NAME in request.POST
-            and "index" not in request.POST
-            and "_save" not in request.POST
-        ):
-            if selected:
-                response = self.response_action(
-                    request,
-                    queryset=cl.get_queryset(request),
-                    action_location=ActionLocation.CHANGE_LIST,
-                )
-                if response:
-                    return response
-                else:
-                    action_failed = True
-
+        action_response, action_failed = self._handle_changelist_action(
+            request, cl, actions
+        )
+        if action_response is not None:
+            return action_response
         if action_failed:
             # Redirect back to the changelist page to avoid resubmitting the
             # form if the user refreshes the browser or uses the "No, take
