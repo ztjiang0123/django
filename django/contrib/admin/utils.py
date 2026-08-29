@@ -430,56 +430,82 @@ def help_text_for_field(name, model):
     return help_text
 
 
+def _display_for_choices(value, field, empty_value_display):
+    try:
+        return dict(field.flatchoices).get(value, empty_value_display)
+    except TypeError:
+        # Allow list-like choices.
+        flatchoices = make_hashable(field.flatchoices)
+        value = make_hashable(value)
+        return dict(flatchoices).get(value, empty_value_display)
+
+
+def _display_for_file_field(value, field):
+    return format_html('<a href="{}">{}</a>', value.url, value)
+
+
+def _display_for_url_field(value, field, empty_value_display):
+    # Only render a clickable link for URLs with a safe scheme, so that a
+    # potentially dangerous stored value is shown as plain text rather than an
+    # executable link. The check is deliberately independent of the field's own
+    # validators, which may permit such schemes.
+    try:
+        URLValidator()(value)
+    except ValidationError:
+        return display_for_value(value, empty_value_display)
+    return format_html('<a href="{}">{}</a>', value, value)
+
+
+def _display_for_json_field(value, field, empty_value_display):
+    try:
+        return json.dumps(value, ensure_ascii=False, cls=field.encoder)
+    except TypeError:
+        return display_for_value(value, empty_value_display)
+
+
 def display_for_field(value, field, empty_value_display, avoid_link=False):
     from django.contrib.admin.templatetags.admin_list import _boolean_icon
     from django.db.models.expressions import DatabaseDefault
 
     if field.name == "password" and field.model == get_user_model():
         return render_password_as_hash(value)
-    elif getattr(field, "flatchoices", None):
-        try:
-            return dict(field.flatchoices).get(value, empty_value_display)
-        except TypeError:
-            # Allow list-like choices.
-            flatchoices = make_hashable(field.flatchoices)
-            value = make_hashable(value)
-            return dict(flatchoices).get(value, empty_value_display)
+
+    if getattr(field, "flatchoices", None):
+        return _display_for_choices(value, field, empty_value_display)
 
     # BooleanField needs special-case null-handling, so it comes before the
     # general null test.
-    elif isinstance(field, models.BooleanField):
+    if isinstance(field, models.BooleanField):
         if isinstance(value, DatabaseDefault):
             return _boolean_icon(None)
         return _boolean_icon(value)
-    elif value in field.empty_values or isinstance(value, DatabaseDefault):
+
+    if value in field.empty_values or isinstance(value, DatabaseDefault):
         return empty_value_display
-    elif isinstance(field, models.DateTimeField):
+
+    if isinstance(field, models.DateTimeField):
         return formats.localize(timezone.template_localtime(value))
-    elif isinstance(field, (models.DateField, models.TimeField)):
+
+    if isinstance(field, (models.DateField, models.TimeField)):
         return formats.localize(value)
-    elif isinstance(field, models.DecimalField):
+
+    if isinstance(field, models.DecimalField):
         return formats.number_format(value, field.decimal_places)
-    elif isinstance(field, (models.IntegerField, models.FloatField)):
+
+    if isinstance(field, (models.IntegerField, models.FloatField)):
         return formats.number_format(value)
-    elif isinstance(field, models.FileField) and value and not avoid_link:
-        return format_html('<a href="{}">{}</a>', value.url, value)
-    elif isinstance(field, models.URLField) and value and not avoid_link:
-        # Only render a clickable link for URLs with a safe scheme, so that a
-        # potentially dangerous stored value is shown as plain text rather than
-        # an executable link. The check is deliberately independent of the
-        # field's own validators, which may permit such schemes.
-        try:
-            URLValidator()(value)
-        except ValidationError:
-            return display_for_value(value, empty_value_display)
-        return format_html('<a href="{}">{}</a>', value, value)
-    elif isinstance(field, models.JSONField) and value:
-        try:
-            return json.dumps(value, ensure_ascii=False, cls=field.encoder)
-        except TypeError:
-            return display_for_value(value, empty_value_display)
-    else:
-        return display_for_value(value, empty_value_display)
+
+    linkable = value and not avoid_link
+    if linkable and isinstance(field, models.FileField):
+        return _display_for_file_field(value, field)
+
+    if linkable and isinstance(field, models.URLField):
+        return _display_for_url_field(value, field, empty_value_display)
+
+    if value and isinstance(field, models.JSONField):
+        return _display_for_json_field(value, field, empty_value_display)
+
+    return display_for_value(value, empty_value_display)
 
 
 def display_for_value(value, empty_value_display, boolean=False):
