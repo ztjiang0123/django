@@ -172,89 +172,119 @@ class ChangeList:
                 del lookup_params[ignored]
         return lookup_params
 
-    def get_filters(self, request):
-        lookup_params = self.get_filters_params()
-        may_have_duplicates = False
-        has_active_filters = False
-
+    def _check_lookups_allowed(self, lookup_params, request):
         for key, value_list in lookup_params.items():
             for value in value_list:
                 if not self.model_admin.lookup_allowed(key, value, request):
                     raise DisallowedModelAdminLookup(f"Filtering by {key} not allowed")
 
+    def _get_filter_spec(self, list_filter, lookup_params, request):
+        """
+        Build a single filter spec for a configured ``list_filter`` entry.
+
+        Return a ``(spec, field_path)`` tuple; ``field_path`` is None for
+        callable filters that don't operate on a model field.
+        """
+        if callable(list_filter):
+            # This is simply a custom list filter class.
+            spec = list_filter(request, lookup_params, self.model, self.model_admin)
+            return spec, None
+
+        if isinstance(list_filter, (tuple, list)):
+            # This is a custom FieldListFilter class for a given field.
+            field, field_list_filter_class = list_filter
+        else:
+            # This is simply a field name, so use the default FieldListFilter
+            # class that has been registered for the type of the given field.
+            field, field_list_filter_class = list_filter, FieldListFilter.create
+
+        field_path = None
+        if not isinstance(field, Field):
+            field_path = field
+            field = get_fields_from_path(self.model, field_path)[-1]
+
+        spec = field_list_filter_class(
+            field,
+            request,
+            lookup_params,
+            self.model,
+            self.model_admin,
+            field_path=field_path,
+        )
+        return spec, field_path
+
+    def _build_filter_specs(self, lookup_params, request):
+        """
+        Build the list of filter specs, consuming the lookup params they use.
+
+        Return a ``(filter_specs, may_have_duplicates, has_active_filters)``
+        tuple.
+        """
         filter_specs = []
+        may_have_duplicates = False
+        has_active_filters = False
         for list_filter in self.list_filter:
             lookup_params_count = len(lookup_params)
-            if callable(list_filter):
-                # This is simply a custom list filter class.
-                spec = list_filter(request, lookup_params, self.model, self.model_admin)
-            else:
-                field_path = None
-                if isinstance(list_filter, (tuple, list)):
-                    # This is a custom FieldListFilter class for a given field.
-                    field, field_list_filter_class = list_filter
-                else:
-                    # This is simply a field name, so use the default
-                    # FieldListFilter class that has been registered for the
-                    # type of the given field.
-                    field, field_list_filter_class = list_filter, FieldListFilter.create
-                if not isinstance(field, Field):
-                    field_path = field
-                    field = get_fields_from_path(self.model, field_path)[-1]
-
-                spec = field_list_filter_class(
-                    field,
-                    request,
-                    lookup_params,
-                    self.model,
-                    self.model_admin,
-                    field_path=field_path,
+            spec, field_path = self._get_filter_spec(
+                list_filter, lookup_params, request
+            )
+            # field_list_filter_class removes any lookup_params it processes.
+            # If that happened, check if duplicates should be removed.
+            consumed_params = lookup_params_count > len(lookup_params)
+            if consumed_params and field_path is not None:
+                may_have_duplicates |= lookup_spawns_duplicates(
+                    self.lookup_opts,
+                    field_path,
                 )
-                # field_list_filter_class removes any lookup_params it
-                # processes. If that happened, check if duplicates should be
-                # removed.
-                if lookup_params_count > len(lookup_params):
-                    may_have_duplicates |= lookup_spawns_duplicates(
-                        self.lookup_opts,
-                        field_path,
-                    )
             if spec and spec.has_output():
                 filter_specs.append(spec)
-                if lookup_params_count > len(lookup_params):
+                if consumed_params:
                     has_active_filters = True
+        return filter_specs, may_have_duplicates, has_active_filters
+
+    def _apply_date_hierarchy(self, lookup_params):
+        # Create bounded lookup parameters so that the query is more efficient.
+        year = lookup_params.pop("%s__year" % self.date_hierarchy, None)
+        if year is None:
+            return
+        month = lookup_params.pop("%s__month" % self.date_hierarchy, None)
+        day = lookup_params.pop("%s__day" % self.date_hierarchy, None)
+        try:
+            from_date = datetime(
+                int(year[-1]),
+                int(month[-1] if month is not None else 1),
+                int(day[-1] if day is not None else 1),
+            )
+        except ValueError as e:
+            raise IncorrectLookupParameters(e) from e
+        if day:
+            to_date = from_date + timedelta(days=1)
+        elif month:
+            # In this branch, from_date will always be the first of a month, so
+            # advancing 32 days gives the next month.
+            to_date = (from_date + timedelta(days=32)).replace(day=1)
+        else:
+            to_date = from_date.replace(year=from_date.year + 1)
+        if settings.USE_TZ:
+            from_date = make_aware(from_date)
+            to_date = make_aware(to_date)
+        lookup_params.update(
+            {
+                "%s__gte" % self.date_hierarchy: [from_date],
+                "%s__lt" % self.date_hierarchy: [to_date],
+            }
+        )
+
+    def get_filters(self, request):
+        lookup_params = self.get_filters_params()
+        self._check_lookups_allowed(lookup_params, request)
+
+        filter_specs, may_have_duplicates, has_active_filters = (
+            self._build_filter_specs(lookup_params, request)
+        )
 
         if self.date_hierarchy:
-            # Create bounded lookup parameters so that the query is more
-            # efficient.
-            year = lookup_params.pop("%s__year" % self.date_hierarchy, None)
-            if year is not None:
-                month = lookup_params.pop("%s__month" % self.date_hierarchy, None)
-                day = lookup_params.pop("%s__day" % self.date_hierarchy, None)
-                try:
-                    from_date = datetime(
-                        int(year[-1]),
-                        int(month[-1] if month is not None else 1),
-                        int(day[-1] if day is not None else 1),
-                    )
-                except ValueError as e:
-                    raise IncorrectLookupParameters(e) from e
-                if day:
-                    to_date = from_date + timedelta(days=1)
-                elif month:
-                    # In this branch, from_date will always be the first of a
-                    # month, so advancing 32 days gives the next month.
-                    to_date = (from_date + timedelta(days=32)).replace(day=1)
-                else:
-                    to_date = from_date.replace(year=from_date.year + 1)
-                if settings.USE_TZ:
-                    from_date = make_aware(from_date)
-                    to_date = make_aware(to_date)
-                lookup_params.update(
-                    {
-                        "%s__gte" % self.date_hierarchy: [from_date],
-                        "%s__lt" % self.date_hierarchy: [to_date],
-                    }
-                )
+            self._apply_date_hierarchy(lookup_params)
 
         # At this point, all the parameters used by the various ListFilters
         # have been removed from lookup_params, which now only contains other
@@ -343,6 +373,17 @@ class ChangeList:
             ordering = self.lookup_opts.ordering
         return ordering
 
+    def _get_non_field_ordering_attr(self, field_name):
+        """
+        Resolve the callable/attribute backing a non-field ``field_name`` that
+        may still allow sorting via its ``admin_order_field``.
+        """
+        if callable(field_name):
+            return field_name
+        if hasattr(self.model_admin, field_name) and field_name != "__str__":
+            return getattr(self.model_admin, field_name)
+        return getattr(self.model, field_name)
+
     def get_ordering_field(self, field_name):
         """
         Return the proper model field name corresponding to the given
@@ -355,22 +396,47 @@ class ChangeList:
             field = self.lookup_opts.get_field(field_name)
             return field.name
         except FieldDoesNotExist:
-            # See whether field_name is a name of a non-field
-            # that allows sorting.
-            if callable(field_name):
-                attr = field_name
-            elif hasattr(self.model_admin, field_name) and field_name != "__str__":
-                attr = getattr(self.model_admin, field_name)
-            else:
-                try:
-                    attr = getattr(self.model, field_name)
-                except AttributeError:
-                    if LOOKUP_SEP in field_name:
-                        return field_name
-                    raise
-            if isinstance(attr, property) and hasattr(attr, "fget"):
-                attr = attr.fget
-            return getattr(attr, "admin_order_field", None)
+            pass
+
+        # See whether field_name is a name of a non-field that allows sorting.
+        try:
+            attr = self._get_non_field_ordering_attr(field_name)
+        except AttributeError:
+            if LOOKUP_SEP in field_name:
+                return field_name
+            raise
+        if isinstance(attr, property) and hasattr(attr, "fget"):
+            attr = attr.fget
+        return getattr(attr, "admin_order_field", None)
+
+    def _resolve_order_param(self, param):
+        """
+        Translate a single query-string ordering token (e.g. ``"-2"``) into an
+        ordering value understood by the queryset, or None if it should be
+        skipped.
+
+        Raise IndexError/ValueError for a malformed token so the caller can
+        skip it.
+        """
+        none, pfx, idx = param.rpartition("-")
+        field_name = self.list_display[int(idx)]
+        order_field = self.get_ordering_field(field_name)
+        descending = pfx == "-"
+
+        if not order_field:
+            return None  # No 'admin_order_field', skip it.
+        if isinstance(order_field, OrderBy):
+            if descending:
+                order_field = order_field.copy()
+                order_field.reverse_ordering()
+            return order_field
+        if hasattr(order_field, "resolve_expression"):
+            # order_field is an expression.
+            return order_field.desc() if descending else order_field.asc()
+        # Reverse order if order_field already has "-" as a prefix.
+        if descending and order_field.startswith("-"):
+            return order_field.removeprefix("-")
+        return pfx + order_field
 
     def get_ordering(self, request, queryset):
         """
@@ -388,31 +454,13 @@ class ChangeList:
         if params.get(ORDER_VAR):
             # Clear ordering and used params
             ordering = []
-            order_params = params[ORDER_VAR].split(".")
-            for p in order_params:
+            for p in params[ORDER_VAR].split("."):
                 try:
-                    none, pfx, idx = p.rpartition("-")
-                    field_name = self.list_display[int(idx)]
-                    order_field = self.get_ordering_field(field_name)
-                    if not order_field:
-                        continue  # No 'admin_order_field', skip it
-                    if isinstance(order_field, OrderBy):
-                        if pfx == "-":
-                            order_field = order_field.copy()
-                            order_field.reverse_ordering()
-                        ordering.append(order_field)
-                    elif hasattr(order_field, "resolve_expression"):
-                        # order_field is an expression.
-                        ordering.append(
-                            order_field.desc() if pfx == "-" else order_field.asc()
-                        )
-                    # reverse order if order_field has already "-" as prefix
-                    elif pfx == "-" and order_field.startswith(pfx):
-                        ordering.append(order_field.removeprefix(pfx))
-                    else:
-                        ordering.append(pfx + order_field)
+                    order_field = self._resolve_order_param(p)
                 except (IndexError, ValueError):
                     continue  # Invalid ordering specified, skip it.
+                if order_field is not None:
+                    ordering.append(order_field)
 
         # Add the given query's ordering fields, if any.
         ordering.extend(queryset.query.order_by)
@@ -421,45 +469,58 @@ class ChangeList:
             return ordering
         return ordering + ["-pk"]
 
+    def _default_ordering_field_type(self, field):
+        """
+        Classify a default-ordering entry into a ``(field_name, order_type)``
+        pair, or None if the entry cannot be mapped to a sortable field name.
+        """
+        if isinstance(field, (Combinable, OrderBy)):
+            if not isinstance(field, OrderBy):
+                field = field.asc()
+            if not isinstance(field.expression, F):
+                return None
+            order_type = "desc" if field.descending else "asc"
+            return field.expression.name, order_type
+        if field.startswith("-"):
+            return field.removeprefix("-"), "desc"
+        return field, "asc"
+
+    def _ordering_columns_from_default(self, ordering):
+        # For ordering specified on ModelAdmin or model Meta, we don't know the
+        # right column numbers absolutely, because there might be more than one
+        # column associated with that ordering, so we guess.
+        ordering_fields = {}
+        for field in ordering:
+            classified = self._default_ordering_field_type(field)
+            if classified is None:
+                continue
+            field_name, order_type = classified
+            for index, attr in enumerate(self.list_display):
+                if self.get_ordering_field(attr) == field_name:
+                    ordering_fields[index] = order_type
+                    break
+        return ordering_fields
+
+    def _ordering_columns_from_params(self):
+        ordering_fields = {}
+        for p in self.params[ORDER_VAR].split("."):
+            none, pfx, idx = p.rpartition("-")
+            try:
+                idx = int(idx)
+            except ValueError:
+                continue  # skip it
+            ordering_fields[idx] = "desc" if pfx == "-" else "asc"
+        return ordering_fields
+
     def get_ordering_field_columns(self):
         """
         Return a dictionary of ordering field column numbers and asc/desc.
         """
         # We must cope with more than one column having the same underlying
         # sort field, so we base things on column numbers.
-        ordering = self._get_default_ordering()
-        ordering_fields = {}
-        if ORDER_VAR not in self.params:
-            # for ordering specified on ModelAdmin or model Meta, we don't know
-            # the right column numbers absolutely, because there might be more
-            # than one column associated with that ordering, so we guess.
-            for field in ordering:
-                if isinstance(field, (Combinable, OrderBy)):
-                    if not isinstance(field, OrderBy):
-                        field = field.asc()
-                    if isinstance(field.expression, F):
-                        order_type = "desc" if field.descending else "asc"
-                        field = field.expression.name
-                    else:
-                        continue
-                elif field.startswith("-"):
-                    field = field.removeprefix("-")
-                    order_type = "desc"
-                else:
-                    order_type = "asc"
-                for index, attr in enumerate(self.list_display):
-                    if self.get_ordering_field(attr) == field:
-                        ordering_fields[index] = order_type
-                        break
-        else:
-            for p in self.params[ORDER_VAR].split("."):
-                none, pfx, idx = p.rpartition("-")
-                try:
-                    idx = int(idx)
-                except ValueError:
-                    continue  # skip it
-                ordering_fields[idx] = "desc" if pfx == "-" else "asc"
-        return ordering_fields
+        if ORDER_VAR in self.params:
+            return self._ordering_columns_from_params()
+        return self._ordering_columns_from_default(self._get_default_ordering())
 
     def get_queryset(self, request, exclude_parameters=None):
         # First, we collect all the declared list filters.
