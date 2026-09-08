@@ -1351,8 +1351,8 @@ class ModelAdmin(BaseModelAdmin):
             return explicit_lookup
         return "%s__icontains" % field_name, None
 
-    @staticmethod
-    def _resolve_explicit_lookup(queryset, field_name):
+    @classmethod
+    def _resolve_explicit_lookup(cls, queryset, field_name):
         """
         Follow ``field_name``'s relation chain and, if it ends in a query
         lookup rather than a field, return the (lookup, field_to_validate)
@@ -1363,21 +1363,36 @@ class ModelAdmin(BaseModelAdmin):
         for path_part in field_name.split(LOOKUP_SEP):
             if path_part == "pk":
                 path_part = opts.pk.name
-            try:
-                field = opts.get_field(path_part)
-            except FieldDoesNotExist:
+            field = cls._get_field_or_none(opts, path_part)
+            if field is None:
+                # Not a field; treat a valid query lookup as the terminal.
                 if prev_field and prev_field.get_lookup(path_part):
-                    non_text_exact = path_part == "exact" and not isinstance(
-                        prev_field, (models.CharField, models.TextField)
-                    )
-                    # Use prev_field to validate non-text exact search terms.
-                    return field_name, prev_field if non_text_exact else None
+                    return field_name, cls._exact_validate_field(prev_field, path_part)
                 continue
             prev_field = field
             if hasattr(field, "path_infos"):
                 # Update opts to follow the relation.
                 opts = field.path_infos[-1].to_opts
         return None
+
+    @staticmethod
+    def _get_field_or_none(opts, path_part):
+        try:
+            return opts.get_field(path_part)
+        except FieldDoesNotExist:
+            return None
+
+    @staticmethod
+    def _exact_validate_field(prev_field, path_part):
+        """
+        Return the field used to validate a non-text ``exact`` lookup so
+        invalid search terms can be skipped, or None when no validation
+        applies.
+        """
+        non_text_exact = path_part == "exact" and not isinstance(
+            prev_field, (models.CharField, models.TextField)
+        )
+        return prev_field if non_text_exact else None
 
     @staticmethod
     def _split_search_bits(search_term):
