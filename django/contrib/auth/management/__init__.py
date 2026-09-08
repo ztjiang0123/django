@@ -134,6 +134,24 @@ def _collect_model_renames(plan, app_label):
     ]
 
 
+def _plan_permission_rename(perm, actions, new_suffix, verbose_name_raw):
+    """
+    Return the planned rename for ``perm``, or ``None`` if no action matches.
+
+    The planned rename is a ``(perm, old_codename, new_codename, new_name)``
+    tuple.
+    """
+    for action in actions:
+        if perm.codename.startswith(action + "_"):
+            return (
+                perm,
+                perm.codename,
+                f"{action}{new_suffix}",
+                f"Can {action} {verbose_name_raw}",
+            )
+    return None
+
+
 def _plan_permission_renames(apps, Permission, db, app_label, renames):
     """
     Build the list of planned permission renames for the given model renames.
@@ -152,17 +170,11 @@ def _plan_permission_renames(apps, Permission, db, app_label, renames):
         )
 
         for perm in perms:
-            for action in actions:
-                if not perm.codename.startswith(action + "_"):
-                    continue
-                planned.append(
-                    (
-                        perm,
-                        perm.codename,
-                        f"{action}{new_suffix}",
-                        f"Can {action} {verbose_name_raw}",
-                    )
-                )
+            rename = _plan_permission_rename(
+                perm, actions, new_suffix, verbose_name_raw
+            )
+            if rename is not None:
+                planned.append(rename)
     return planned
 
 
