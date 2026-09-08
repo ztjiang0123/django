@@ -1303,89 +1303,104 @@ class ModelAdmin(BaseModelAdmin):
         Return a tuple containing a queryset to implement the search
         and a boolean indicating if the results may contain duplicates.
         """
-
-        # Apply keyword searches.
-        def construct_search(field_name):
-            """
-            Return a tuple of (lookup, field_to_validate).
-
-            field_to_validate is set for non-text exact lookups so that
-            invalid search terms can be skipped (preserving index usage).
-            """
-            if field_name.startswith("^"):
-                return "%s__istartswith" % field_name.removeprefix("^"), None
-            elif field_name.startswith("="):
-                return "%s__iexact" % field_name.removeprefix("="), None
-            elif field_name.startswith("@"):
-                return "%s__search" % field_name.removeprefix("@"), None
-            # Use field_name if it includes a lookup.
-            opts = queryset.model._meta
-            lookup_fields = field_name.split(LOOKUP_SEP)
-            # Go through the fields, following all relations.
-            prev_field = None
-            for path_part in lookup_fields:
-                if path_part == "pk":
-                    path_part = opts.pk.name
-                try:
-                    field = opts.get_field(path_part)
-                except FieldDoesNotExist:
-                    # Use valid query lookups.
-                    if prev_field and prev_field.get_lookup(path_part):
-                        if path_part == "exact" and not isinstance(
-                            prev_field, (models.CharField, models.TextField)
-                        ):
-                            # Use prev_field to validate the search term.
-                            return field_name, prev_field
-                        return field_name, None
-                else:
-                    prev_field = field
-                    if hasattr(field, "path_infos"):
-                        # Update opts to follow the relation.
-                        opts = field.path_infos[-1].to_opts
-            # Otherwise, use the field with icontains.
-            return "%s__icontains" % field_name, None
-
-        may_have_duplicates = False
         search_fields = self.get_search_fields(request)
-        if search_fields and search_term:
-            orm_lookups = []
-            for field in search_fields:
-                orm_lookups.append(construct_search(str(field)))
+        if not (search_fields and search_term):
+            return queryset, False
 
-            term_queries = []
-            for bit in smart_split(search_term):
-                if bit.startswith(('"', "'")) and bit[0] == bit[-1]:
-                    bit = unescape_string_literal(bit)
-                # Build term lookups, skipping values invalid for their field.
-                bit_lookups = []
-                for orm_lookup, validate_field in orm_lookups:
-                    if validate_field is not None:
-                        formfield = validate_field.formfield()
-                        try:
-                            if formfield is not None:
-                                value = formfield.to_python(bit)
-                            else:
-                                # Fields like AutoField lack a form field.
-                                value = validate_field.to_python(bit)
-                        except ValidationError:
-                            # Skip this lookup for invalid values.
-                            continue
-                    else:
-                        value = bit
-                    bit_lookups.append((orm_lookup, value))
-                if bit_lookups:
-                    or_queries = models.Q.create(bit_lookups, connector=models.Q.OR)
-                    term_queries.append(or_queries)
-                else:
-                    # No valid lookups: add a filter that returns nothing.
-                    term_queries.append(models.Q(pk__in=[]))
-            if term_queries:
-                queryset = queryset.filter(models.Q.create(term_queries))
-            may_have_duplicates |= any(
-                lookup_spawns_duplicates(self.opts, search_spec)
-                for search_spec, _ in orm_lookups
-            )
+        orm_lookups = [
+            self._construct_search(queryset, str(field)) for field in search_fields
+        ]
+
+        term_queries = [
+            self._term_query(bit, orm_lookups)
+            for bit in self._split_search_bits(search_term)
+        ]
+        if term_queries:
+            queryset = queryset.filter(models.Q.create(term_queries))
+
+        may_have_duplicates = any(
+            lookup_spawns_duplicates(self.opts, search_spec)
+            for search_spec, _ in orm_lookups
+        )
         return queryset, may_have_duplicates
+
+    @staticmethod
+    def _construct_search(queryset, field_name):
+        """
+        Return a tuple of (lookup, field_to_validate).
+
+        field_to_validate is set for non-text exact lookups so that
+        invalid search terms can be skipped (preserving index usage).
+        """
+        if field_name.startswith("^"):
+            return "%s__istartswith" % field_name.removeprefix("^"), None
+        elif field_name.startswith("="):
+            return "%s__iexact" % field_name.removeprefix("="), None
+        elif field_name.startswith("@"):
+            return "%s__search" % field_name.removeprefix("@"), None
+
+        # Use field_name if it includes a lookup.
+        opts = queryset.model._meta
+        # Go through the fields, following all relations.
+        prev_field = None
+        for path_part in field_name.split(LOOKUP_SEP):
+            if path_part == "pk":
+                path_part = opts.pk.name
+            try:
+                field = opts.get_field(path_part)
+            except FieldDoesNotExist:
+                # Use valid query lookups.
+                if prev_field and prev_field.get_lookup(path_part):
+                    non_text_exact = path_part == "exact" and not isinstance(
+                        prev_field, (models.CharField, models.TextField)
+                    )
+                    # Use prev_field to validate non-text exact search terms.
+                    return field_name, prev_field if non_text_exact else None
+            else:
+                prev_field = field
+                if hasattr(field, "path_infos"):
+                    # Update opts to follow the relation.
+                    opts = field.path_infos[-1].to_opts
+        # Otherwise, use the field with icontains.
+        return "%s__icontains" % field_name, None
+
+    @staticmethod
+    def _split_search_bits(search_term):
+        for bit in smart_split(search_term):
+            if bit.startswith(('"', "'")) and bit[0] == bit[-1]:
+                bit = unescape_string_literal(bit)
+            yield bit
+
+    @staticmethod
+    def _validated_lookup_value(validate_field, bit):
+        """
+        Coerce a search bit to the field's type, or None if it's invalid.
+
+        Returns (value, is_valid).
+        """
+        if validate_field is None:
+            return bit, True
+        formfield = validate_field.formfield()
+        try:
+            if formfield is not None:
+                return formfield.to_python(bit), True
+            # Fields like AutoField lack a form field.
+            return validate_field.to_python(bit), True
+        except ValidationError:
+            # Skip this lookup for invalid values.
+            return None, False
+
+    def _term_query(self, bit, orm_lookups):
+        # Build term lookups, skipping values invalid for their field.
+        bit_lookups = []
+        for orm_lookup, validate_field in orm_lookups:
+            value, is_valid = self._validated_lookup_value(validate_field, bit)
+            if is_valid:
+                bit_lookups.append((orm_lookup, value))
+        if not bit_lookups:
+            # No valid lookups: add a filter that returns nothing.
+            return models.Q(pk__in=[])
+        return models.Q.create(bit_lookups, connector=models.Q.OR)
 
     def get_preserved_filters(self, request):
         """
@@ -1551,6 +1566,66 @@ class ModelAdmin(BaseModelAdmin):
         query_string = urlsplit(request.build_absolute_uri()).query
         return parse_qsl(query_string.replace(preserved_filters, ""))
 
+    def _find_popup_optgroup(self, request, obj):
+        """
+        Return the optgroup label for the newly added ``obj`` in the source
+        admin's form field, or None if it isn't grouped or can't be found.
+        """
+        source_model_name = request.POST.get(SOURCE_MODEL_VAR)
+        if not source_model_name:
+            return None
+        try:
+            app_label, model_name = source_model_name.split(".", 1)
+            source_model = apps.get_model(app_label, model_name)
+        except (LookupError, ValueError):
+            msg = _('The app "%s" could not be found.') % source_model_name
+            self.message_user(request, msg, messages.ERROR)
+            return None
+
+        source_admin = self.admin_site._registry.get(source_model)
+        if not source_admin:
+            return None
+        form = source_admin.get_form(request)()
+        if self.opts.verbose_name_plural not in form.fields:
+            return None
+
+        field = form.fields[self.opts.verbose_name_plural]
+        optgroup = None
+        for option_value, option_label in field.choices:
+            # An optgroup has a label that is a sequence of choices rather than
+            # a single string value: (group_name, [(value, label), ...]).
+            if not isinstance(option_label, (list, tuple)):
+                continue
+            if any(display == str(obj) for _, display in option_label):
+                # Match the last containing optgroup, as historically done.
+                optgroup = str(option_value)
+        return optgroup
+
+    def _popup_response_add(self, request, obj):
+        opts = obj._meta
+        to_field = request.POST.get(TO_FIELD_VAR)
+        attr = str(to_field) if to_field else obj._meta.pk.attname
+        popup_response = {
+            "value": str(obj.serializable_value(attr)),
+            "obj": str(obj),
+        }
+        optgroup = self._find_popup_optgroup(request, obj)
+        if optgroup is not None:
+            popup_response["optgroup"] = optgroup
+
+        return TemplateResponse(
+            request,
+            self.popup_response_template
+            or [
+                "admin/%s/%s/popup_response.html" % (opts.app_label, opts.model_name),
+                "admin/%s/popup_response.html" % opts.app_label,
+                "admin/popup_response.html",
+            ],
+            {
+                "popup_response_data": json.dumps(popup_response),
+            },
+        )
+
     def response_add(self, request, obj, post_url_continue=None):
         """
         Determine the HttpResponse for the add_view stage.
@@ -1565,7 +1640,8 @@ class ModelAdmin(BaseModelAdmin):
         )
         # Add a link to the object's change form if the user can edit the obj.
         obj_display = display_for_value(str(obj), EMPTY_VALUE_STRING)
-        if self.has_change_permission(request, obj):
+        can_change = self.has_change_permission(request, obj)
+        if can_change:
             obj_repr = format_html(
                 '<a href="{}">{}</a>', urlquote(obj_url), obj_display
             )
@@ -1578,82 +1654,26 @@ class ModelAdmin(BaseModelAdmin):
         # Here, we distinguish between different save types by checking for
         # the presence of keys in request.POST.
 
+        preserved = {
+            "preserved_filters": preserved_filters,
+            "preserved_qsl": preserved_qsl,
+            "opts": opts,
+        }
+        save_as_new_continue = (
+            "_saveasnew" in request.POST and self.save_as_continue and can_change
+        )
+
         if IS_POPUP_VAR in request.POST:
-            to_field = request.POST.get(TO_FIELD_VAR)
-            if to_field:
-                attr = str(to_field)
-            else:
-                attr = obj._meta.pk.attname
-            value = obj.serializable_value(attr)
-            popup_response = {
-                "value": str(value),
-                "obj": str(obj),
-            }
+            return self._popup_response_add(request, obj)
 
-            # Find the optgroup for the new item, if available
-            source_model_name = request.POST.get(SOURCE_MODEL_VAR)
-            source_admin = None
-            if source_model_name:
-                try:
-                    app_label, model_name = source_model_name.split(".", 1)
-                    source_model = apps.get_model(app_label, model_name)
-                except (LookupError, ValueError):
-                    msg = _('The app "%s" could not be found.') % source_model_name
-                    self.message_user(request, msg, messages.ERROR)
-                else:
-                    source_admin = self.admin_site._registry.get(source_model)
-
-            if source_admin:
-                form = source_admin.get_form(request)()
-                if self.opts.verbose_name_plural in form.fields:
-                    field = form.fields[self.opts.verbose_name_plural]
-                    for option_value, option_label in field.choices:
-                        # Check if this is an optgroup (label is a sequence
-                        # of choices rather than a single string value).
-                        if isinstance(option_label, (list, tuple)):
-                            # It's an optgroup:
-                            # (group_name, [(value, label), ...])
-                            optgroup_label = option_value
-                            for choice_value, choice_display in option_label:
-                                if choice_display == str(obj):
-                                    popup_response["optgroup"] = str(optgroup_label)
-                                    break
-
-            popup_response_data = json.dumps(popup_response)
-            return TemplateResponse(
-                request,
-                self.popup_response_template
-                or [
-                    "admin/%s/%s/popup_response.html"
-                    % (opts.app_label, opts.model_name),
-                    "admin/%s/popup_response.html" % opts.app_label,
-                    "admin/popup_response.html",
-                ],
-                {
-                    "popup_response_data": popup_response_data,
-                },
-            )
-
-        elif "_continue" in request.POST or (
-            # Redirecting after "Save as new".
-            "_saveasnew" in request.POST
-            and self.save_as_continue
-            and self.has_change_permission(request, obj)
-        ):
+        elif "_continue" in request.POST or save_as_new_continue:
             msg = _("The {name} “{obj}” was added successfully.")
-            if self.has_change_permission(request, obj):
+            if can_change:
                 msg += " " + _("You may edit it again below.")
             self.message_user(request, format_html(msg, **msg_dict), messages.SUCCESS)
             if post_url_continue is None:
                 post_url_continue = obj_url
-            post_url_continue = add_preserved_filters(
-                {
-                    "preserved_filters": preserved_filters,
-                    "preserved_qsl": preserved_qsl,
-                    "opts": opts,
-                },
-                post_url_continue,
-            )
+            post_url_continue = add_preserved_filters(preserved, post_url_continue)
             return HttpResponseRedirect(post_url_continue)
 
         elif "_addanother" in request.POST:
@@ -1665,15 +1685,7 @@ class ModelAdmin(BaseModelAdmin):
                 **msg_dict,
             )
             self.message_user(request, msg, messages.SUCCESS)
-            redirect_url = request.path
-            redirect_url = add_preserved_filters(
-                {
-                    "preserved_filters": preserved_filters,
-                    "preserved_qsl": preserved_qsl,
-                    "opts": opts,
-                },
-                redirect_url,
-            )
+            redirect_url = add_preserved_filters(preserved, request.path)
             return HttpResponseRedirect(redirect_url)
 
         else:
