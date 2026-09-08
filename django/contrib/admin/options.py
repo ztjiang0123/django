@@ -1324,24 +1324,41 @@ class ModelAdmin(BaseModelAdmin):
         )
         return queryset, may_have_duplicates
 
-    @staticmethod
-    def _construct_search(queryset, field_name):
+    # Search field prefixes mapped to their ORM lookup suffix.
+    _SEARCH_PREFIX_LOOKUPS = {
+        "^": "istartswith",
+        "=": "iexact",
+        "@": "search",
+    }
+
+    @classmethod
+    def _construct_search(cls, queryset, field_name):
         """
         Return a tuple of (lookup, field_to_validate).
 
         field_to_validate is set for non-text exact lookups so that
         invalid search terms can be skipped (preserving index usage).
         """
-        if field_name.startswith("^"):
-            return "%s__istartswith" % field_name.removeprefix("^"), None
-        elif field_name.startswith("="):
-            return "%s__iexact" % field_name.removeprefix("="), None
-        elif field_name.startswith("@"):
-            return "%s__search" % field_name.removeprefix("@"), None
+        prefix = field_name[:1]
+        if prefix in cls._SEARCH_PREFIX_LOOKUPS:
+            suffix = cls._SEARCH_PREFIX_LOOKUPS[prefix]
+            return "%s__%s" % (field_name.removeprefix(prefix), suffix), None
 
-        # Use field_name if it includes a lookup.
+        # Use field_name if it includes an explicit lookup, otherwise fall
+        # back to icontains on the resolved field.
+        explicit_lookup = cls._resolve_explicit_lookup(queryset, field_name)
+        if explicit_lookup is not None:
+            return explicit_lookup
+        return "%s__icontains" % field_name, None
+
+    @staticmethod
+    def _resolve_explicit_lookup(queryset, field_name):
+        """
+        Follow ``field_name``'s relation chain and, if it ends in a query
+        lookup rather than a field, return the (lookup, field_to_validate)
+        tuple for it. Return None when there is no explicit lookup.
+        """
         opts = queryset.model._meta
-        # Go through the fields, following all relations.
         prev_field = None
         for path_part in field_name.split(LOOKUP_SEP):
             if path_part == "pk":
@@ -1349,20 +1366,18 @@ class ModelAdmin(BaseModelAdmin):
             try:
                 field = opts.get_field(path_part)
             except FieldDoesNotExist:
-                # Use valid query lookups.
                 if prev_field and prev_field.get_lookup(path_part):
                     non_text_exact = path_part == "exact" and not isinstance(
                         prev_field, (models.CharField, models.TextField)
                     )
                     # Use prev_field to validate non-text exact search terms.
                     return field_name, prev_field if non_text_exact else None
-            else:
-                prev_field = field
-                if hasattr(field, "path_infos"):
-                    # Update opts to follow the relation.
-                    opts = field.path_infos[-1].to_opts
-        # Otherwise, use the field with icontains.
-        return "%s__icontains" % field_name, None
+                continue
+            prev_field = field
+            if hasattr(field, "path_infos"):
+                # Update opts to follow the relation.
+                opts = field.path_infos[-1].to_opts
+        return None
 
     @staticmethod
     def _split_search_bits(search_term):
