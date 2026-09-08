@@ -52,56 +52,56 @@ class Command(BaseCommand):
             if not include_stale_apps and app_label not in apps.app_configs:
                 continue
             to_remove = [ct for ct in content_types if ct.model_class() is None]
-            # Confirm that the content type is stale before deletion.
-            using = router.db_for_write(ContentType)
-            if to_remove:
-                if interactive:
-                    ct_info = []
-                    for ct in to_remove:
-                        ct_info.append(
-                            "    - Content type for %s.%s" % (ct.app_label, ct.model)
-                        )
-                        collector = Collector(
-                            using=using, origin=ct, force_collection=True
-                        )
-                        collector.collect([ct])
+            if not to_remove:
+                continue
+            if self._confirm_deletion(to_remove, interactive):
+                self._delete_content_types(to_remove, verbosity)
+            elif verbosity >= 2:
+                self.stdout.write("Stale content types remain.")
 
-                        for obj_type, objs in collector.data.items():
-                            if objs != {ct}:
-                                ct_info.append(
-                                    "    - %s %s object(s)"
-                                    % (
-                                        len(objs),
-                                        obj_type._meta.label,
-                                    )
-                                )
-                    content_type_display = "\n".join(ct_info)
-                    self.stdout.write(
-                        "Some content types in your database are stale and can be "
-                        "deleted.\n"
-                        "Any objects that depend on these content types will also be "
-                        "deleted.\n"
-                        "The content types and dependent objects that would be deleted "
-                        "are:\n\n"
-                        f"{content_type_display}\n\n"
-                        "This list doesn't include any cascade deletions to data "
-                        "outside of Django\n"
-                        "models (uncommon).\n\n"
-                        "Are you sure you want to delete these content types?\n"
-                        "If you're unsure, answer 'no'."
+    def _confirm_deletion(self, to_remove, interactive):
+        """
+        Return whether the given stale content types may be deleted, prompting
+        the user for confirmation when running interactively.
+        """
+        if not interactive:
+            return True
+        self.stdout.write(self._deletion_prompt(to_remove))
+        return input("Type 'yes' to continue, or 'no' to cancel: ") == "yes"
+
+    def _deletion_prompt(self, to_remove):
+        """Build the interactive confirmation message for stale types."""
+        # Confirm that the content type is stale before deletion.
+        using = router.db_for_write(ContentType)
+        ct_info = []
+        for ct in to_remove:
+            ct_info.append("    - Content type for %s.%s" % (ct.app_label, ct.model))
+            collector = Collector(using=using, origin=ct, force_collection=True)
+            collector.collect([ct])
+
+            for obj_type, objs in collector.data.items():
+                if objs != {ct}:
+                    ct_info.append(
+                        "    - %s %s object(s)" % (len(objs), obj_type._meta.label)
                     )
-                    ok_to_delete = input("Type 'yes' to continue, or 'no' to cancel: ")
-                else:
-                    ok_to_delete = "yes"
+        content_type_display = "\n".join(ct_info)
+        return (
+            "Some content types in your database are stale and can be deleted.\n"
+            "Any objects that depend on these content types will also be deleted.\n"
+            "The content types and dependent objects that would be deleted are:\n\n"
+            f"{content_type_display}\n\n"
+            "This list doesn't include any cascade deletions to data outside of "
+            "Django\n"
+            "models (uncommon).\n\n"
+            "Are you sure you want to delete these content types?\n"
+            "If you're unsure, answer 'no'."
+        )
 
-                if ok_to_delete == "yes":
-                    for ct in to_remove:
-                        if verbosity >= 2:
-                            self.stdout.write(
-                                "Deleting stale content type '%s | %s'"
-                                % (ct.app_label, ct.model)
-                            )
-                        ct.delete()
-                else:
-                    if verbosity >= 2:
-                        self.stdout.write("Stale content types remain.")
+    def _delete_content_types(self, to_remove, verbosity):
+        """Delete the given stale content types."""
+        for ct in to_remove:
+            if verbosity >= 2:
+                self.stdout.write(
+                    "Deleting stale content type '%s | %s'" % (ct.app_label, ct.model)
+                )
+            ct.delete()

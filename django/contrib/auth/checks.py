@@ -120,6 +120,118 @@ def check_user_model(app_configs, **kwargs):
     return errors
 
 
+class _ModelPermissionChecker:
+    """Collect permission-related check errors for a single model."""
+
+    def __init__(self, model, name_max_length, codename_max_length):
+        self.model = model
+        self.opts = model._meta
+        self.name_max_length = name_max_length
+        self.codename_max_length = codename_max_length
+        self.builtin_permissions = dict(_get_builtin_permissions(self.opts))
+
+    def check(self):
+        """Run all permission checks and return the collected errors."""
+        errors = self._check_builtin_name_length()
+        errors += self._check_builtin_codename_length()
+        errors += self._check_custom_permissions()
+        return errors
+
+    def _check_builtin_name_length(self):
+        if not self.builtin_permissions:
+            return []
+        max_length = max(len(name) for name in self.builtin_permissions.values())
+        if max_length <= self.name_max_length:
+            return []
+        verbose_name_max_length = self.name_max_length - (
+            max_length - len(self.opts.verbose_name_raw)
+        )
+        return [
+            checks.Error(
+                "The verbose_name of model '%s' must be at most %d "
+                "characters for its builtin permission names to be at "
+                "most %d characters."
+                % (self.opts.label, verbose_name_max_length, self.name_max_length),
+                obj=self.model,
+                id="auth.E007",
+            )
+        ]
+
+    def _check_builtin_codename_length(self):
+        if not self.builtin_permissions:
+            return []
+        max_length = max(len(codename) for codename in self.builtin_permissions)
+        if max_length <= self.codename_max_length:
+            return []
+        model_name_max_length = self.codename_max_length - (
+            max_length - len(self.opts.model_name)
+        )
+        return [
+            checks.Error(
+                "The name of model '%s' must be at most %d characters "
+                "for its builtin permission codenames to be at most %d "
+                "characters."
+                % (self.opts.label, model_name_max_length, self.codename_max_length),
+                obj=self.model,
+                id="auth.E011",
+            )
+        ]
+
+    def _check_custom_permissions(self):
+        errors = []
+        seen_codenames = set()
+        for codename, name in self.opts.permissions:
+            errors += self._check_custom_permission(codename, name, seen_codenames)
+            seen_codenames.add(codename)
+        return errors
+
+    def _check_custom_permission(self, codename, name, seen_codenames):
+        """Check a single custom permission for length and clashing issues."""
+        errors = []
+        # Check custom permission name length.
+        if len(name) > self.name_max_length:
+            errors.append(
+                checks.Error(
+                    "The permission named '%s' of model '%s' is longer "
+                    "than %d characters."
+                    % (name, self.opts.label, self.name_max_length),
+                    obj=self.model,
+                    id="auth.E008",
+                )
+            )
+        # Check custom permission codename length.
+        if len(codename) > self.codename_max_length:
+            errors.append(
+                checks.Error(
+                    "The permission codenamed '%s' of model '%s' is "
+                    "longer than %d characters."
+                    % (codename, self.opts.label, self.codename_max_length),
+                    obj=self.model,
+                    id="auth.E012",
+                )
+            )
+        # Check custom permissions codename clashing.
+        if codename in self.builtin_permissions:
+            errors.append(
+                checks.Error(
+                    "The permission codenamed '%s' clashes with a builtin "
+                    "permission for model '%s'." % (codename, self.opts.label),
+                    obj=self.model,
+                    id="auth.E005",
+                )
+            )
+        elif codename in seen_codenames:
+            errors.append(
+                checks.Error(
+                    "The permission codenamed '%s' is duplicated for "
+                    "model '%s'." % (codename, self.opts.label),
+                    obj=self.model,
+                    id="auth.E006",
+                )
+            )
+        return errors
+
+
 def check_models_permissions(app_configs, **kwargs):
     if app_configs is None:
         models = apps.get_models()
@@ -134,104 +246,9 @@ def check_models_permissions(app_configs, **kwargs):
     errors = []
 
     for model in models:
-        opts = model._meta
-        builtin_permissions = dict(_get_builtin_permissions(opts))
-        # Check builtin permission name length.
-        max_builtin_permission_name_length = (
-            max(len(name) for name in builtin_permissions.values())
-            if builtin_permissions
-            else 0
-        )
-        if max_builtin_permission_name_length > permission_name_max_length:
-            verbose_name_max_length = permission_name_max_length - (
-                max_builtin_permission_name_length - len(opts.verbose_name_raw)
-            )
-            errors.append(
-                checks.Error(
-                    "The verbose_name of model '%s' must be at most %d "
-                    "characters for its builtin permission names to be at "
-                    "most %d characters."
-                    % (opts.label, verbose_name_max_length, permission_name_max_length),
-                    obj=model,
-                    id="auth.E007",
-                )
-            )
-        # Check builtin permission codename length.
-        max_builtin_permission_codename_length = (
-            max(len(codename) for codename in builtin_permissions.keys())
-            if builtin_permissions
-            else 0
-        )
-        if max_builtin_permission_codename_length > permission_codename_max_length:
-            model_name_max_length = permission_codename_max_length - (
-                max_builtin_permission_codename_length - len(opts.model_name)
-            )
-            errors.append(
-                checks.Error(
-                    "The name of model '%s' must be at most %d characters "
-                    "for its builtin permission codenames to be at most %d "
-                    "characters."
-                    % (
-                        opts.label,
-                        model_name_max_length,
-                        permission_codename_max_length,
-                    ),
-                    obj=model,
-                    id="auth.E011",
-                )
-            )
-        codenames = set()
-        for codename, name in opts.permissions:
-            # Check custom permission name length.
-            if len(name) > permission_name_max_length:
-                errors.append(
-                    checks.Error(
-                        "The permission named '%s' of model '%s' is longer "
-                        "than %d characters."
-                        % (
-                            name,
-                            opts.label,
-                            permission_name_max_length,
-                        ),
-                        obj=model,
-                        id="auth.E008",
-                    )
-                )
-            # Check custom permission codename length.
-            if len(codename) > permission_codename_max_length:
-                errors.append(
-                    checks.Error(
-                        "The permission codenamed '%s' of model '%s' is "
-                        "longer than %d characters."
-                        % (
-                            codename,
-                            opts.label,
-                            permission_codename_max_length,
-                        ),
-                        obj=model,
-                        id="auth.E012",
-                    )
-                )
-            # Check custom permissions codename clashing.
-            if codename in builtin_permissions:
-                errors.append(
-                    checks.Error(
-                        "The permission codenamed '%s' clashes with a builtin "
-                        "permission for model '%s'." % (codename, opts.label),
-                        obj=model,
-                        id="auth.E005",
-                    )
-                )
-            elif codename in codenames:
-                errors.append(
-                    checks.Error(
-                        "The permission codenamed '%s' is duplicated for "
-                        "model '%s'." % (codename, opts.label),
-                        obj=model,
-                        id="auth.E006",
-                    )
-                )
-            codenames.add(codename)
+        errors += _ModelPermissionChecker(
+            model, permission_name_max_length, permission_codename_max_length
+        ).check()
 
     return errors
 
