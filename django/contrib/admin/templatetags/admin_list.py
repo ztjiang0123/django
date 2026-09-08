@@ -85,6 +85,86 @@ def pagination_tag(parser, token):
     )
 
 
+def _action_checkbox_header():
+    aria_label = _("Select all objects on this page for an action")
+    return {
+        "text": SafeString(
+            f'<input type="checkbox" id="action-toggle" ' f'aria-label="{aria_label}">'
+        ),
+        "class_attrib": SafeString(' class="action-checkbox-column"'),
+        "sortable": False,
+    }
+
+
+def _is_attr_sortable(attr, field_name):
+    admin_order_field = getattr(attr, "admin_order_field", None)
+    # Set ordering for attr that is a property, if defined.
+    if isinstance(attr, property) and hasattr(attr, "fget"):
+        admin_order_field = getattr(attr.fget, "admin_order_field", None)
+    is_field_lookup = LOOKUP_SEP in field_name and isinstance(attr, models.Field)
+    return bool(admin_order_field) or is_field_lookup
+
+
+def _ordering_urls(cl, i, new_order_type, ordering_field_columns):
+    """
+    Build the primary/remove/toggle ordering querystrings for a header.
+    """
+    o_list_primary = []  # URL for making this field the primary sort
+    o_list_remove = []  # URL for removing this field from sort
+    o_list_toggle = []  # URL for toggling order type for this field
+
+    def make_qs_param(t, n):
+        return ("-" if t == "desc" else "") + str(n)
+
+    for j, ot in ordering_field_columns.items():
+        if j == i:  # Same column
+            param = make_qs_param(new_order_type, j)
+            # Clicking on this header brings the ordering to the front.
+            o_list_primary.insert(0, param)
+            o_list_toggle.append(param)
+            # o_list_remove - omit
+        else:
+            param = make_qs_param(ot, j)
+            o_list_primary.append(param)
+            o_list_toggle.append(param)
+            o_list_remove.append(param)
+
+    if i not in ordering_field_columns:
+        o_list_primary.insert(0, make_qs_param(new_order_type, i))
+
+    return {
+        "url_primary": cl.get_query_string({ORDER_VAR: ".".join(o_list_primary)}),
+        "url_remove": cl.get_query_string({ORDER_VAR: ".".join(o_list_remove)}),
+        "url_toggle": cl.get_query_string({ORDER_VAR: ".".join(o_list_toggle)}),
+    }
+
+
+def _sortable_header(cl, i, text, field_name, ordering_field_columns):
+    th_classes = ["sortable", "column-{}".format(field_name)]
+    order_type = ""
+    new_order_type = "asc"
+    sort_priority = 0
+    # Is it currently being sorted on?
+    is_sorted = i in ordering_field_columns
+    if is_sorted:
+        order_type = ordering_field_columns.get(i).lower()
+        sort_priority = list(ordering_field_columns).index(i) + 1
+        th_classes.append("sorted %sending" % order_type)
+        new_order_type = {"asc": "desc", "desc": "asc"}[order_type]
+
+    return {
+        "text": text,
+        "sortable": True,
+        "sorted": is_sorted,
+        "ascending": order_type == "asc",
+        "sort_priority": sort_priority,
+        **_ordering_urls(cl, i, new_order_type, ordering_field_columns),
+        "class_attrib": (
+            format_html(' class="{}"', " ".join(th_classes)) if th_classes else ""
+        ),
+    }
+
+
 def result_headers(cl):
     """
     Generate the list column headers.
@@ -101,24 +181,10 @@ def result_headers(cl):
 
             # if the field is the action checkbox: no sorting and special class
             if field_name == "action_checkbox":
-                aria_label = _("Select all objects on this page for an action")
-                yield {
-                    "text": SafeString(
-                        f'<input type="checkbox" id="action-toggle" '
-                        f'aria-label="{aria_label}">'
-                    ),
-                    "class_attrib": SafeString(' class="action-checkbox-column"'),
-                    "sortable": False,
-                }
+                yield _action_checkbox_header()
                 continue
 
-            admin_order_field = getattr(attr, "admin_order_field", None)
-            # Set ordering for attr that is a property, if defined.
-            if isinstance(attr, property) and hasattr(attr, "fget"):
-                admin_order_field = getattr(attr.fget, "admin_order_field", None)
-            if not admin_order_field and not (
-                LOOKUP_SEP in field_name and isinstance(attr, models.Field)
-            ):
+            if not _is_attr_sortable(attr, field_name):
                 is_field_sortable = False
 
         if not is_field_sortable:
@@ -131,56 +197,7 @@ def result_headers(cl):
             continue
 
         # OK, it is sortable if we got this far
-        th_classes = ["sortable", "column-{}".format(field_name)]
-        order_type = ""
-        new_order_type = "asc"
-        sort_priority = 0
-        # Is it currently being sorted on?
-        is_sorted = i in ordering_field_columns
-        if is_sorted:
-            order_type = ordering_field_columns.get(i).lower()
-            sort_priority = list(ordering_field_columns).index(i) + 1
-            th_classes.append("sorted %sending" % order_type)
-            new_order_type = {"asc": "desc", "desc": "asc"}[order_type]
-
-        # build new ordering param
-        o_list_primary = []  # URL for making this field the primary sort
-        o_list_remove = []  # URL for removing this field from sort
-        o_list_toggle = []  # URL for toggling order type for this field
-
-        def make_qs_param(t, n):
-            return ("-" if t == "desc" else "") + str(n)
-
-        for j, ot in ordering_field_columns.items():
-            if j == i:  # Same column
-                param = make_qs_param(new_order_type, j)
-                # We want clicking on this header to bring the ordering to the
-                # front
-                o_list_primary.insert(0, param)
-                o_list_toggle.append(param)
-                # o_list_remove - omit
-            else:
-                param = make_qs_param(ot, j)
-                o_list_primary.append(param)
-                o_list_toggle.append(param)
-                o_list_remove.append(param)
-
-        if i not in ordering_field_columns:
-            o_list_primary.insert(0, make_qs_param(new_order_type, i))
-
-        yield {
-            "text": text,
-            "sortable": True,
-            "sorted": is_sorted,
-            "ascending": order_type == "asc",
-            "sort_priority": sort_priority,
-            "url_primary": cl.get_query_string({ORDER_VAR: ".".join(o_list_primary)}),
-            "url_remove": cl.get_query_string({ORDER_VAR: ".".join(o_list_remove)}),
-            "url_toggle": cl.get_query_string({ORDER_VAR: ".".join(o_list_toggle)}),
-            "class_attrib": (
-                format_html(' class="{}"', " ".join(th_classes)) if th_classes else ""
-            ),
-        }
+        yield _sortable_header(cl, i, text, field_name, ordering_field_columns)
 
 
 def _boolean_icon(field_val):
@@ -202,117 +219,135 @@ def _coerce_field_name(field_name, field_index):
     return field_name
 
 
+def _link_in_col(is_first, field_name, cl):
+    if cl.list_display_links is None:
+        return False
+    if is_first and not cl.list_display_links:
+        return True
+    return field_name in cl.list_display_links
+
+
+def _attr_is_boolean(attr):
+    # Set boolean for attr that is a property, if defined.
+    if isinstance(attr, property) and hasattr(attr, "fget"):
+        return getattr(attr.fget, "boolean", False)
+    return getattr(attr, "boolean", False)
+
+
+def _terminal_field(cl, f, field_name):
+    """Find a terminal field from a chain of relations."""
+    if f is None and isinstance(field_name, str) and LOOKUP_SEP in field_name:
+        try:
+            return get_fields_from_path(cl.model, field_name)[-1]
+        except FieldDoesNotExist:
+            pass  # e.g. __str__
+    return f
+
+
+def _result_repr_for_value(attr, value, empty_value_display, field_name, row_classes):
+    """Representation for computed/auto-created fields (no model field)."""
+    if field_name == "action_checkbox":
+        row_classes[:] = ["action-checkbox"]
+    result_repr = display_for_value(value, empty_value_display, _attr_is_boolean(attr))
+    if isinstance(value, (datetime.date, datetime.time)):
+        row_classes.append("nowrap")
+    return result_repr
+
+
+def _result_repr_for_field(
+    f, value, empty_value_display, link_to_changelist, row_classes
+):
+    """Representation for a concrete model field."""
+    if isinstance(f.remote_field, models.ManyToOneRel):
+        result_repr = empty_value_display if value is None else value
+    else:
+        result_repr = display_for_field(
+            value, f, empty_value_display, avoid_link=link_to_changelist
+        )
+    if isinstance(f, (models.DateField, models.TimeField, models.ForeignKey)):
+        row_classes.append("nowrap")
+    return result_repr
+
+
+def _result_repr(cl, result, field_name, link_to_changelist, row_classes):
+    """Compute the display representation for one field of a result row."""
+    empty_value_display = cl.model_admin.get_empty_value_display()
+    try:
+        f, attr, value = lookup_field(field_name, result, cl.model_admin)
+    except ObjectDoesNotExist:
+        return empty_value_display
+
+    empty_value_display = getattr(attr, "empty_value_display", empty_value_display)
+    f = _terminal_field(cl, f, field_name)
+    if f is None or f.auto_created:
+        return _result_repr_for_value(
+            attr, value, empty_value_display, field_name, row_classes
+        )
+    return _result_repr_for_field(
+        f, value, empty_value_display, link_to_changelist, row_classes
+    )
+
+
+def _linked_cell(cl, result, result_repr, table_tag, row_class):
+    """Render a header/data cell that links to the result's change view."""
+    try:
+        url = cl.url_for_result(result)
+    except NoReverseMatch:
+        link_or_text = result_repr
+    else:
+        url = add_preserved_filters(
+            {"preserved_filters": cl.preserved_filters, "opts": cl.opts}, url
+        )
+        # Convert the pk to something that can be used in JavaScript.
+        # Problem cases are non-ASCII strings.
+        attr = str(cl.to_field) if cl.to_field else cl.lookup_opts.pk.attname
+        value = result.serializable_value(attr)
+        popup_opener = (
+            format_html(' data-popup-opener="{}"', value) if cl.is_popup else ""
+        )
+        link_or_text = format_html(
+            '<a href="{}"{}>{}</a>', url, popup_opener, result_repr
+        )
+    return format_html("<{}{}>{}</{}>", table_tag, row_class, link_or_text, table_tag)
+
+
+def _editable_cell_repr(cl, form, field_name, result_repr):
+    """Override the representation with a form field for editable columns."""
+    # By default the fields come from ModelAdmin.list_editable, but if we pull
+    # the fields out of the form instead of list_editable custom admins can
+    # provide fields on a per request basis.
+    pk_name = cl.model._meta.pk.name
+    editable = (
+        form
+        and field_name in form.fields
+        and not (field_name == pk_name and form[pk_name].is_hidden)
+    )
+    if editable:
+        bf = form[field_name]
+        return mark_safe(str(bf.errors) + str(bf))
+    return result_repr
+
+
 def items_for_result(cl, result, form):
     """
     Generate the actual list of data.
     """
-
-    def link_in_col(is_first, field_name, cl):
-        if cl.list_display_links is None:
-            return False
-        if is_first and not cl.list_display_links:
-            return True
-        return field_name in cl.list_display_links
-
     first = True
-    pk = cl.lookup_opts.pk.attname
     for field_index, field_name in enumerate(cl.list_display):
-        empty_value_display = cl.model_admin.get_empty_value_display()
         row_classes = ["field-%s" % _coerce_field_name(field_name, field_index)]
-        link_to_changelist = link_in_col(first, field_name, cl)
-        try:
-            f, attr, value = lookup_field(field_name, result, cl.model_admin)
-        except ObjectDoesNotExist:
-            result_repr = empty_value_display
-        else:
-            empty_value_display = getattr(
-                attr, "empty_value_display", empty_value_display
-            )
-            # Find a terminal field from a chain of relations.
-            if f is None and isinstance(field_name, str) and LOOKUP_SEP in field_name:
-                try:
-                    f = get_fields_from_path(cl.model, field_name)[-1]
-                except FieldDoesNotExist:
-                    pass  # e.g. __str__
-            if f is None or f.auto_created:
-                if field_name == "action_checkbox":
-                    row_classes = ["action-checkbox"]
-                boolean = getattr(attr, "boolean", False)
-                # Set boolean for attr that is a property, if defined.
-                if isinstance(attr, property) and hasattr(attr, "fget"):
-                    boolean = getattr(attr.fget, "boolean", False)
-                result_repr = display_for_value(value, empty_value_display, boolean)
-                if isinstance(value, (datetime.date, datetime.time)):
-                    row_classes.append("nowrap")
-            else:
-                if isinstance(f.remote_field, models.ManyToOneRel):
-                    if value is None:
-                        result_repr = empty_value_display
-                    else:
-                        result_repr = value
-                else:
-                    result_repr = display_for_field(
-                        value,
-                        f,
-                        empty_value_display,
-                        avoid_link=link_to_changelist,
-                    )
-                if isinstance(
-                    f, (models.DateField, models.TimeField, models.ForeignKey)
-                ):
-                    row_classes.append("nowrap")
+        link_to_changelist = _link_in_col(first, field_name, cl)
+        result_repr = _result_repr(
+            cl, result, field_name, link_to_changelist, row_classes
+        )
         row_class = SafeString(' class="%s"' % " ".join(row_classes))
         # If list_display_links not defined, add the link tag to the first
         # field
         if link_to_changelist:
             table_tag = "th" if first else "td"
             first = False
-
-            # Display link to the result's change_view if the url exists, else
-            # display just the result's representation.
-            try:
-                url = cl.url_for_result(result)
-            except NoReverseMatch:
-                link_or_text = result_repr
-            else:
-                url = add_preserved_filters(
-                    {"preserved_filters": cl.preserved_filters, "opts": cl.opts}, url
-                )
-                # Convert the pk to something that can be used in JavaScript.
-                # Problem cases are non-ASCII strings.
-                if cl.to_field:
-                    attr = str(cl.to_field)
-                else:
-                    attr = pk
-                value = result.serializable_value(attr)
-                link_or_text = format_html(
-                    '<a href="{}"{}>{}</a>',
-                    url,
-                    (
-                        format_html(' data-popup-opener="{}"', value)
-                        if cl.is_popup
-                        else ""
-                    ),
-                    result_repr,
-                )
-
-            yield format_html(
-                "<{}{}>{}</{}>", table_tag, row_class, link_or_text, table_tag
-            )
+            yield _linked_cell(cl, result, result_repr, table_tag, row_class)
         else:
-            # By default the fields come from ModelAdmin.list_editable, but if
-            # we pull the fields out of the form instead of list_editable
-            # custom admins can provide fields on a per request basis
-            if (
-                form
-                and field_name in form.fields
-                and not (
-                    field_name == cl.model._meta.pk.name
-                    and form[cl.model._meta.pk.name].is_hidden
-                )
-            ):
-                bf = form[field_name]
-                result_repr = mark_safe(str(bf.errors) + str(bf))
+            result_repr = _editable_cell_repr(cl, form, field_name, result_repr)
             yield format_html("<td{}>{}</td>", row_class, result_repr)
     if form and not form[cl.model._meta.pk.name].is_hidden:
         yield format_html("<td>{}</td>", form[cl.model._meta.pk.name])
@@ -376,113 +411,123 @@ def result_list_tag(parser, token):
     )
 
 
+def _date_hierarchy_start_level(cl, field_name, dates_or_datetimes):
+    """
+    When no year/month/day is selected, pick the initial drill-down level by
+    inspecting the range of values, returning (year_lookup, month_lookup).
+    """
+    date_range = cl.queryset.aggregate(
+        first=models.Min(field_name), last=models.Max(field_name)
+    )
+    if not (date_range["first"] and date_range["last"]):
+        return None, None
+    if dates_or_datetimes == "datetimes":
+        date_range = {
+            k: timezone.localtime(v) if timezone.is_aware(v) else v
+            for k, v in date_range.items()
+        }
+    first, last = date_range["first"], date_range["last"]
+    if first.year != last.year:
+        return None, None
+    if first.month != last.month:
+        return first.year, None
+    return first.year, first.month
+
+
 def date_hierarchy(cl):
     """
     Display the date hierarchy for date drill-down functionality.
     """
-    if cl.date_hierarchy:
-        field_name = cl.date_hierarchy
-        field = get_fields_from_path(cl.model, field_name)[-1]
-        field_verbose_name = field.verbose_name
-        if isinstance(field, models.DateTimeField):
-            dates_or_datetimes = "datetimes"
-        else:
-            dates_or_datetimes = "dates"
-        year_field = "%s__year" % field_name
-        month_field = "%s__month" % field_name
-        day_field = "%s__day" % field_name
-        field_generic = "%s__" % field_name
-        year_lookup = cl.params.get(year_field)
-        month_lookup = cl.params.get(month_field)
-        day_lookup = cl.params.get(day_field)
+    if not cl.date_hierarchy:
+        return
 
-        def link(filters):
-            return cl.get_query_string(filters, [field_generic])
+    field_name = cl.date_hierarchy
+    field = get_fields_from_path(cl.model, field_name)[-1]
+    field_verbose_name = field.verbose_name
+    if isinstance(field, models.DateTimeField):
+        dates_or_datetimes = "datetimes"
+    else:
+        dates_or_datetimes = "dates"
+    year_field = "%s__year" % field_name
+    month_field = "%s__month" % field_name
+    day_field = "%s__day" % field_name
+    field_generic = "%s__" % field_name
+    year_lookup = cl.params.get(year_field)
+    month_lookup = cl.params.get(month_field)
+    day_lookup = cl.params.get(day_field)
 
-        if not (year_lookup or month_lookup or day_lookup):
-            # select appropriate start level
-            date_range = cl.queryset.aggregate(
-                first=models.Min(field_name), last=models.Max(field_name)
-            )
-            if date_range["first"] and date_range["last"]:
-                if dates_or_datetimes == "datetimes":
-                    date_range = {
-                        k: timezone.localtime(v) if timezone.is_aware(v) else v
-                        for k, v in date_range.items()
-                    }
-                if date_range["first"].year == date_range["last"].year:
-                    year_lookup = date_range["first"].year
-                    if date_range["first"].month == date_range["last"].month:
-                        month_lookup = date_range["first"].month
+    def link(filters):
+        return cl.get_query_string(filters, [field_generic])
 
-        if year_lookup and month_lookup and day_lookup:
-            day = datetime.date(int(year_lookup), int(month_lookup), int(day_lookup))
-            return {
-                "show": True,
-                "back": {
-                    "link": link({year_field: year_lookup, month_field: month_lookup}),
-                    "title": capfirst(formats.date_format(day, "YEAR_MONTH_FORMAT")),
-                },
-                "choices": [
-                    {"title": capfirst(formats.date_format(day, "MONTH_DAY_FORMAT"))}
-                ],
-                "field_name": field_verbose_name,
-            }
-        elif year_lookup and month_lookup:
-            days = getattr(cl.queryset, dates_or_datetimes)(field_name, "day")
-            return {
-                "show": True,
-                "back": {
-                    "link": link({year_field: year_lookup}),
-                    "title": str(year_lookup),
-                },
-                "choices": [
-                    {
-                        "link": link(
-                            {
-                                year_field: year_lookup,
-                                month_field: month_lookup,
-                                day_field: day.day,
-                            }
-                        ),
-                        "title": capfirst(formats.date_format(day, "MONTH_DAY_FORMAT")),
-                    }
-                    for day in days
-                ],
-                "field_name": field_verbose_name,
-            }
-        elif year_lookup:
-            months = getattr(cl.queryset, dates_or_datetimes)(field_name, "month")
-            return {
-                "show": True,
-                "back": {"link": link({}), "title": _("All dates")},
-                "choices": [
-                    {
-                        "link": link(
-                            {year_field: year_lookup, month_field: month.month}
-                        ),
-                        "title": capfirst(
-                            formats.date_format(month, "YEAR_MONTH_FORMAT")
-                        ),
-                    }
-                    for month in months
-                ],
-                "field_name": field_verbose_name,
-            }
-        else:
-            years = getattr(cl.queryset, dates_or_datetimes)(field_name, "year")
-            return {
-                "show": True,
-                "back": None,
-                "choices": [
-                    {
-                        "link": link({year_field: str(year.year)}),
-                        "title": str(year.year),
-                    }
-                    for year in years
-                ],
-                "field_name": field_verbose_name,
-            }
+    if not (year_lookup or month_lookup or day_lookup):
+        year_lookup, month_lookup = _date_hierarchy_start_level(
+            cl, field_name, dates_or_datetimes
+        )
+
+    if year_lookup and month_lookup and day_lookup:
+        day = datetime.date(int(year_lookup), int(month_lookup), int(day_lookup))
+        return {
+            "show": True,
+            "back": {
+                "link": link({year_field: year_lookup, month_field: month_lookup}),
+                "title": capfirst(formats.date_format(day, "YEAR_MONTH_FORMAT")),
+            },
+            "choices": [
+                {"title": capfirst(formats.date_format(day, "MONTH_DAY_FORMAT"))}
+            ],
+            "field_name": field_verbose_name,
+        }
+    elif year_lookup and month_lookup:
+        days = getattr(cl.queryset, dates_or_datetimes)(field_name, "day")
+        return {
+            "show": True,
+            "back": {
+                "link": link({year_field: year_lookup}),
+                "title": str(year_lookup),
+            },
+            "choices": [
+                {
+                    "link": link(
+                        {
+                            year_field: year_lookup,
+                            month_field: month_lookup,
+                            day_field: day.day,
+                        }
+                    ),
+                    "title": capfirst(formats.date_format(day, "MONTH_DAY_FORMAT")),
+                }
+                for day in days
+            ],
+            "field_name": field_verbose_name,
+        }
+    elif year_lookup:
+        months = getattr(cl.queryset, dates_or_datetimes)(field_name, "month")
+        return {
+            "show": True,
+            "back": {"link": link({}), "title": _("All dates")},
+            "choices": [
+                {
+                    "link": link({year_field: year_lookup, month_field: month.month}),
+                    "title": capfirst(formats.date_format(month, "YEAR_MONTH_FORMAT")),
+                }
+                for month in months
+            ],
+            "field_name": field_verbose_name,
+        }
+    else:
+        years = getattr(cl.queryset, dates_or_datetimes)(field_name, "year")
+        return {
+            "show": True,
+            "back": None,
+            "choices": [
+                {
+                    "link": link({year_field: str(year.year)}),
+                    "title": str(year.year),
+                }
+                for year in years
+            ],
+            "field_name": field_verbose_name,
+        }
 
 
 @register.tag(name="date_hierarchy")
