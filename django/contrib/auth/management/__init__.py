@@ -124,6 +124,80 @@ def _get_permission_metadata(apps, app_label, model_name):
     )
 
 
+def _collect_model_renames(plan, app_label):
+    """Collect (old_name, new_name) rename pairs from a migration plan."""
+    return [
+        (op.new_name, op.old_name) if backward else (op.old_name, op.new_name)
+        for migration, backward in (plan or [])
+        for op in migration.operations
+        if isinstance(op, migrations.RenameModel) and migration.app_label == app_label
+    ]
+
+
+def _plan_permission_renames(apps, Permission, db, app_label, renames):
+    """
+    Build the list of planned permission renames for the given model renames.
+
+    Each entry is a ``(perm, old_codename, new_codename, new_name)`` tuple.
+    """
+    planned = []
+    for old_name, new_name in renames:
+        old_suffix = f"_{old_name.lower()}"
+        new_suffix = f"_{new_name.lower()}"
+
+        actions, verbose_name_raw = _get_permission_metadata(apps, app_label, new_name)
+        perms = Permission.objects.using(db).filter(
+            content_type__app_label=app_label,
+            codename__in=[f"{action}{old_suffix}" for action in actions],
+        )
+
+        for perm in perms:
+            for action in actions:
+                if not perm.codename.startswith(action + "_"):
+                    continue
+                planned.append(
+                    (
+                        perm,
+                        perm.codename,
+                        f"{action}{new_suffix}",
+                        f"Can {action} {verbose_name_raw}",
+                    )
+                )
+    return planned
+
+
+def _find_permission_rename_conflicts(Permission, db, app_label, planned):
+    """
+    Return ``(pk, old_codename, new_codename)`` tuples for planned renames
+    whose target codename already belongs to a different permission.
+    """
+    existing = {
+        p.codename
+        for p in Permission.objects.using(db).filter(
+            content_type__app_label=app_label,
+            codename__in=[new for _, _, new, _ in planned],
+        )
+    }
+    return [
+        (perm.pk, old, new)
+        for perm, old, new, _ in planned
+        if new in existing and perm.codename != new
+    ]
+
+
+def _raise_permission_rename_conflicts(conflicts, verbosity, stdout):
+    """Report conflicts and raise a RuntimeError."""
+    if verbosity:
+        style = color_style()
+        for pk, old, new in conflicts:
+            msg = (
+                f"Failed to rename permission {pk} from '{old}' to '{new}'. "
+                f"Please resolve the conflict manually.\n"
+            )
+            stdout.write(style.WARNING(msg))
+    raise RuntimeError(f"{len(conflicts)} permission rename conflict(s) detected.")
+
+
 def rename_permissions_after_model_rename(
     app_config,
     verbosity=2,
@@ -147,70 +221,19 @@ def rename_permissions_after_model_rename(
         return
 
     db = using or router.db_for_write(Permission)
-
     app_label = app_config.label
 
-    # Collect (from_model, to_model) pairs
-    renames = [
-        (op.new_name, op.old_name) if backward else (op.old_name, op.new_name)
-        for migration, backward in (plan or [])
-        for op in migration.operations
-        if isinstance(op, migrations.RenameModel)
-        and migration.app_label == app_config.label
-    ]
-
+    renames = _collect_model_renames(plan, app_label)
     if not renames:
         return
 
-    planned = []
-    conflicts = []
+    planned = _plan_permission_renames(apps, Permission, db, app_label, renames)
+    if not planned:
+        return
 
-    for old_name, new_name in renames:
-        old_suffix = f"_{old_name.lower()}"
-        new_suffix = f"_{new_name.lower()}"
-
-        actions, verbose_name_raw = _get_permission_metadata(apps, app_label, new_name)
-        perms = Permission.objects.using(db).filter(
-            content_type__app_label=app_label,
-            codename__in=[f"{action}{old_suffix}" for action in actions],
-        )
-
-        for perm in perms:
-            for action in actions:
-                if not perm.codename.startswith(action + "_"):
-                    continue
-
-                old_codename = perm.codename
-                new_codename = f"{action}{new_suffix}"
-                new_name_str = f"Can {action} {verbose_name_raw}"
-
-                planned.append((perm, old_codename, new_codename, new_name_str))
-
-    existing = {
-        p.codename
-        for p in Permission.objects.using(db).filter(
-            content_type__app_label=app_label,
-            codename__in=[new for _, _, new, _ in planned],
-        )
-    }
-
-    # Look for conflicts
-    for perm, old, new, _ in planned:
-        if new in existing and perm.codename != new:
-            conflicts.append((perm.pk, old, new))
-
-    # Raise error if conflicts found
+    conflicts = _find_permission_rename_conflicts(Permission, db, app_label, planned)
     if conflicts:
-        if verbosity:
-            style = color_style()
-            for pk, old, new in conflicts:
-                msg = (
-                    f"Failed to rename permission {pk} from '{old}' to '{new}'. "
-                    f"Please resolve the conflict manually.\n"
-                )
-                stdout.write(style.WARNING(msg))
-        error_message = f"{len(conflicts)} permission rename conflict(s) detected."
-        raise RuntimeError(error_message)
+        _raise_permission_rename_conflicts(conflicts, verbosity, stdout)
 
     with transaction.atomic(using=db):
         for perm, _, new_codename, new_name_str in planned:
@@ -218,8 +241,8 @@ def rename_permissions_after_model_rename(
             perm.name = new_name_str
             perm.save(update_fields={"codename", "name"}, using=db)
 
-    for _, from_codename, to_codename, _ in planned:
-        if verbosity >= 2:
+    if verbosity >= 2:
+        for _, from_codename, to_codename, _ in planned:
             stdout.write(
                 f"Renamed permission(s): "
                 f"{app_label}.{from_codename} → {to_codename}\n"
